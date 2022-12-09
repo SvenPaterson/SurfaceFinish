@@ -30,7 +30,7 @@ def gaussian_filter(data, Fs, cutoff):
     return len(window)//2, np.convolve(window, data, mode="valid")
 
 
-def plot_roughness(data, short_cutoff, long_cutoff, y_lim):
+def plot_roughness(data, short_cutoff, long_cutoff, y_lim = 0):
     long_filt_freq = 1 / long_cutoff
     short_filt_freq = 1 / short_cutoff
     x, primary = np.loadtxt(data, delimiter=",", unpack=True)
@@ -54,7 +54,7 @@ def plot_roughness(data, short_cutoff, long_cutoff, y_lim):
     plt.xlabel("Length, mm")
     plt.ylabel("Height, μm")
     plt.xlim(x_lim)
-    plt.ylim(y_lim)
+    if y_lim: plt.ylim(y_lim)
 
     plt.subplot(212)
     # plot roughness
@@ -64,10 +64,10 @@ def plot_roughness(data, short_cutoff, long_cutoff, y_lim):
     plt.xlabel("Length, mm")
     plt.ylabel("Height, μm")
     plt.xlim(x_lim)
-    plt.ylim(y_lim)
+    if y_lim: plt.ylim(y_lim)
 
     plt.tight_layout()
-    #plt.savefig()
+    plt.show()
 
 
 def main():
@@ -75,22 +75,9 @@ def main():
     short_cutoff = 2.5 / 1000 #mm (i.e. microns)
     y_lim = (-1.5, 0.5)
     
-    start = datetime.now()
-    print(f'start: {start}')
+    # current execution time is approx. 0.3s
     plot_roughness("example_trace.txt", short_cutoff, long_cutoff, y_lim)
-    print(f'end: {datetime.now() - start}')
 
-
-    #y_filtl = butter_lowpass_filter(y, long_filt_freq, Fs) 
-    #y_filth = butter_highpass_filter(y, long_filt_freq, Fs)
-
-    #calc FFT of raw data
-    #y_fft = fft.fft(y)
-    #y_freq = fft.fftfreq(N, T)[:N//2]
-
-    # plt.plot(y_freq, 2.0/N * np.abs(y_fft[:N//2]), linewidth=0.5)
-    #plt.plot(x, y - y_filtl, linewidth=0.5, color="blue")
-    #plt.plot(x, y_filth, linewidth=0.5, color="purple")
 
 if __name__ == "__main__":
     main()
