@@ -3,7 +3,7 @@ import numpy as np
 
 from scipy import fft, signal
 from scipy.signal import butter, filtfilt
-from datetime import datetime
+
 
 def butter_lowpass_filter(data, cutoff, fs, order=5):
     nyq = 0.5 * fs
@@ -30,6 +30,10 @@ def gaussian_filter(data, Fs, cutoff):
     return len(window)//2, np.convolve(window, data, mode="valid")
 
 
+def calc_Ra(data):
+    return sum([abs(x) for x in data]) / len(data)
+
+
 def plot_roughness(data, short_cutoff, long_cutoff, y_lim = 0):
     long_filt_freq = 1 / long_cutoff
     short_filt_freq = 1 / short_cutoff
@@ -44,27 +48,30 @@ def plot_roughness(data, short_cutoff, long_cutoff, y_lim = 0):
     wav_buff, waviness = gaussian_filter(denoised_primary, Fs, long_filt_freq)
     wav_x = prim_x[wav_buff:-wav_buff+1]
     roughness = denoised_primary[wav_buff:-wav_buff+1] - waviness
-
-    plt.subplot(211)
+    
+    _, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 4))
+    
     # plot primary and waviness
-    plt.plot(x, primary, linewidth=0.5, color="blue")
-    plt.plot(wav_x, waviness, linewidth=0.5, color="red")
+    ax1.plot(x, primary, linewidth=0.5, color="blue")
+    ax1.plot(wav_x, waviness, linewidth=0.5, color="red")
     # format 1st plot
-    plt.title(f"Primary + Waviness, λc = {long_cutoff}mm")
-    plt.xlabel("Length, mm")
-    plt.ylabel("Height, μm")
-    plt.xlim(x_lim)
-    if y_lim: plt.ylim(y_lim)
+    ax1.set_title(f"Primary + Waviness, λc = {long_cutoff}mm")
+    ax1.set_xlabel("Length, mm")
+    ax1.set_ylabel("Height, μm")
+    ax1.set_xlim(x_lim)
+    if y_lim: ax1.set_ylim(y_lim)
 
-    plt.subplot(212)
     # plot roughness
-    plt.plot(wav_x, roughness, linewidth=0.5, color="green")
+    ax2.plot(wav_x, roughness, linewidth=0.5, color="green")
     # format 2nd plot
-    plt.title(f"Roughness, λc/s = {long_cutoff}mm / {short_cutoff*1000}μm")
-    plt.xlabel("Length, mm")
-    plt.ylabel("Height, μm")
-    plt.xlim(x_lim)
-    if y_lim: plt.ylim(y_lim)
+    ax2.set_title(f"Roughness, λc/s = {long_cutoff}mm / {short_cutoff*1000}μm")
+    ax2.set_xlabel("Length, mm")
+    ax2.set_ylabel("Height, μm")
+    ax2.set_xlim(x_lim)
+    if y_lim: ax2.set_ylim(y_lim)
+
+    ax2.text(0.85, 0.1, f"Ra = {calc_Ra(roughness):.3f}μm", transform=ax2.transAxes, fontsize=8,
+            verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
     plt.tight_layout()
     plt.show()
