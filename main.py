@@ -52,7 +52,6 @@ def process_roughness(file, short_cutoff, long_cutoff, y_lim = 0):
     
     return primary, waviness, roughness
 
-
 def plot_roughness(data, short_cutoff, long_cutoff, y_lim = 0):
     primary, waviness, roughness = process_roughness(data, short_cutoff, long_cutoff, y_lim)
     x_lim = (primary[0][0], primary[0][-1])
@@ -64,7 +63,7 @@ def plot_roughness(data, short_cutoff, long_cutoff, y_lim = 0):
     ax1.plot(*waviness, linewidth=0.5, color="red")
     # format 1st plot
     ax1.set_title(f"Primary + Waviness, λc = {long_cutoff}mm")
-    ax1.set_xlabel("Length, mm")
+    ax1.set_xlabel("size, mm")
     ax1.set_ylabel("Height, μm")
     ax1.set_xlim(x_lim)
     if y_lim: ax1.set_ylim(y_lim)
@@ -73,7 +72,7 @@ def plot_roughness(data, short_cutoff, long_cutoff, y_lim = 0):
     ax2.plot(*roughness, linewidth=0.5, color="green")
     # format 2nd plot
     ax2.set_title(f"Roughness, λc/s = {long_cutoff}mm / {short_cutoff*1000}μm")
-    ax2.set_xlabel("Length, mm")
+    ax2.set_xlabel("size, mm")
     ax2.set_ylabel("Height, μm")
     ax2.set_xlim(x_lim)
     if y_lim: ax2.set_ylim(y_lim)
@@ -84,31 +83,33 @@ def plot_roughness(data, short_cutoff, long_cutoff, y_lim = 0):
     plt.tight_layout()
     plt.show()
 
-
-def material_ratio(roughness, samples):
-    Rp = max(roughness[1])
-    Rv = min(roughness[1])
+def material_ratio(roughness, samples, Pk_Offset = 1, Vy_Offset = 1):
+    Rp = max(roughness[1]) * (100-Pk_Offset)/100
+    Rv = min(roughness[1]) * (100-Vy_Offset)/100
     Rzmax = Rp - Rv
     T = Rzmax / samples
+    size = len(roughness[1])
+    #offset_roughness = [x - Rv for x in roughness[1]]
+    #size_offset_roughness = len(offset_roughness)
 
-    offset_roughness = [x - Rv for x in roughness[1]]
-    size_offset_roughness = len(offset_roughness)
-    material = 0
-    air = 0
     material_ratio = [], []
     for i in range(samples):
         eval_line = T * i
-        for point in offset_roughness:
-            if point <= eval_line:
+        material = 0
+        for point in roughness[1]:
+            if point-Rv >= eval_line:
                 material += 1
-            else:
-                air += 1
-        material_ratio[0].append(eval_line)
-        material_ratio[1].append(material / size_offset_roughness)
+
+        material_ratio[0].append(eval_line+Rv)
+        material_ratio[1].append(material / size)
     
+    z = np.polyfit(*material_ratio, 1)
+    p = np.poly1d(z)
+    xp = np.linspace(Rv, Rp, 100)
     y, x = material_ratio
-    plt.plot(x, y)
-    plt.ylim(0, 2)
+    plt.plot(x, y, 'b')
+    plt.plot(p(xp), xp, 'r-')
+    #plt.ylim(0, 2)
     plt.show()
         
         
@@ -121,10 +122,10 @@ def main():
 
     primary, waviness, roughness = process_roughness("example_trace.txt", short_cutoff, long_cutoff, y_lim)
 
-    material_ratio(roughness, 100)
+    material_ratio(roughness, 1000)
     
     # current execution time is approx. 0.3s
-    plot_roughness("example_trace.txt", short_cutoff, long_cutoff, y_lim)
+    #plot_roughness("example_trace.txt", short_cutoff, long_cutoff, y_lim)
 
 
 if __name__ == "__main__":
