@@ -19,17 +19,22 @@ class SurfaceTexture():
         wav_buff, waviness = self.gauss_filt(denoised_primary,
                                          1 / self.long_cutoff)
         wav_x = self.primary[0][prim_buff:-prim_buff+1][wav_buff:-wav_buff+1]
-        
+  
         self.roughness = [wav_x, denoised_primary[wav_buff:-wav_buff+1]
                           - waviness]
         self.waviness = [wav_x, waviness]
         # generate roughness parameters
         len_wav_x = len(wav_x)
+
         self.params = {}
-        self.params['Ra'] = (sum(map(abs, self.roughness[1]))
-                            / len_wav_x, "μm")
+        self.params['Ra'] = (sum(map(abs, self.roughness[1])) / len_wav_x, "μm")
         self.params['Rq'] = (np.sqrt(sum(map(np.square, self.roughness[1]))
                             / len_wav_x), "μm")
+        self.params['Rsk'] = (sum([x ** 3 for x in self.roughness[1]]) / \
+                             ((self.params['Rq'][0] ** 3) * len_wav_x), "")
+        self.params['Rku'] = (sum([x ** 4 for x in self.roughness[1]]) / \
+                             ((self.params['Rq'][0] ** 4) * len_wav_x), "")
+        self.params['Rt'] = (max(self.roughness[1]) - min(self.roughness[1]), "μm")
 
     def gauss_filt(self, data, cutoff):
         sigma = self.Fs / (2 * np.pi * cutoff)
@@ -41,8 +46,9 @@ class SurfaceTexture():
     def plot_roughness(self, y_lim=None):
         x_lim = (self.primary[0][0], self.primary[0][-1])
         print(f'x_lim = {x_lim}')
+        
 
-        _, axs = plt.subplots(2, 1, figsize=(9, 4))
+        fig, axs = plt.subplots(2, 1, figsize=(9, 4))
         
         # plot primary and waviness together
         axs[0].plot(*self.primary, linewidth=0.5, color="blue")
@@ -61,84 +67,72 @@ class SurfaceTexture():
             a.set_xlim(x_lim)
             if y_lim: a.set_ylim(y_lim)
 
-        p = ''
+        p = 'ISO 21290-2:2021\n'
         for key in self.params:
-            p += f"\n{key} = {self.params[key][0]:.3f}{self.params[key][1]}"
+            p += f"{key} = {self.params[key][0]:.3f}{self.params[key][1]}\n"
 
-        axs[1].text(0.85, 0.1, p, 
-                 transform=axs[1].transAxes, fontsize=8,
-                 verticalalignment='bottom',
-                 bbox=dict(boxstyle='round', facecolor='wheat', 
-                 alpha=0.5))
+        fig.text(0.05, 0.05, p, 
+                    transform=axs[1].transAxes, fontsize=8,
+                    verticalalignment='bottom',
+                    bbox=dict(boxstyle='round', facecolor='wheat', 
+                    alpha=0.5))
 
         plt.tight_layout()
         plt.show()
 
-    def material_ratio(self, samples, Pk_Offset = 1, Vy_Offset = 1):
-        peak = max(self.roughness[1]) * (100-Pk_Offset)/100
-        valley = min(self.roughness[1]) * (100-Vy_Offset)/100
-        Rzmax = peak - valley
-        T = Rzmax / samples
-        size = len(self.roughness[1])
-        #offset_roughness = [x - Rv for x in roughness[1]]
-        #size_offset_roughness = len(offset_roughness)
+    def material_ratio(self, samples, Pk_Offset = 0.01, Vy_Offset = 0.01):
+        # should have reviewed ISO 21920-2:2021 before writing this!
+        if 0 < Pk_Offset < .25 and 0 < Vy_Offset < .25:
+            pass
+        else:
+            raise ValueError("Pk_Offset and Vy_Offset must be between 0 and 0.25")
 
+        print(f'Pk_Offset = {Pk_Offset}, Vy_Offset = {Vy_Offset}')
+        peak = max(self.roughness[1]) * (1 - Pk_Offset)
+        valley = min(self.roughness[1]) * (1 - Vy_Offset)
+        
         material_ratio = np.zeros((2, samples))
-
         for i in range(samples):
-            eval_line = T * i
+            eval_line = peak - valley / samples * i
             material = 0
             for point in self.roughness[1]:
                 if point-valley >= eval_line:
                     material += 1
             material_ratio[0][i] = eval_line + valley
-            material_ratio[1][i] = 100 * material / size
+            material_ratio[1][i] = 100 * material / len(self.roughness[1])
 
-        """ dt = 10
-        eval_length = samples - dt
-        slope = np.zeros((2, eval_length))
-        for i in range(dt, eval_length):
-            slope[0][i - dt] = material_ratio[1][i]
-            #print(i-dt, material_ratio[0][i], material_ratio[1][i])
-            slope[1][i - dt] = \
-                    (material_ratio[0][i+dt] - material_ratio[0][i-dt]) / \
-                    (material_ratio[1][i+dt] - material_ratio[1][i-dt])
-
-        slope = slope[0][1:-dt], slope[1][1:-dt]
-        for i in range(950, len(slope[0])):
-            print(slope[0][i], slope[1][i])     
-        print(slope[0][0], slope[1][0])
-        print(slope[0][-1], slope[1][-1]) """
-
-        dt = 50
-        slope = np.zeros((2, samples - dt))
-
-        for i in range(samples - dt):
-            slope[0][i] = material_ratio[1][i + dt//2]
-            slope[1][i] = \
-                (material_ratio[0][i] - material_ratio[0][i + dt]) / \
-                (material_ratio[1][i] - material_ratio[1][i + dt])
+        dx = 50 # for finding df/dx
+        mr_slope_x, mr_slope_y = np.zeros(samples - dx), np.zeros(samples - dx)
+        for i in range(samples - dx):
+            mr_slope_x[i] = material_ratio[1][i + dx//2]
+            mr_slope_y[i] = \
+                (material_ratio[0][i] - material_ratio[0][i + dx]) / \
+                (material_ratio[1][i] - material_ratio[1][i + dx])
 
         # Find Rk params
-        index_max = max(range(100, len(slope[1])-100), key=slope[1].__getitem__)
-        Rk_slope = slope[1][index_max]
-        Rk_loc = np.where(material_ratio[1] == slope[0][index_max])
-        Rk_point = (slope[0][index_max], material_ratio[0][Rk_loc])
+        index_max = max(range(100, len(mr_slope_y)-100), key=mr_slope_y.__getitem__)
+        Rk_slope = mr_slope_y[index_max]
+        Rk_loc = np.where(material_ratio[1] == mr_slope_x[index_max])
+        Rk_point = (mr_slope_x[index_max], material_ratio[0][Rk_loc])
 
         # y = mx + b, b = y - mx
         b = Rk_point[1] - Rk_slope * Rk_point[0]
         Rk_line = (np.linspace(0, 100, 100), 
                   Rk_slope * np.linspace(0, 100, 100) + b)
 
+        print(f'Rk_point = {Rk_point}, Rk_slope = {Rk_slope}')
         x_lim = (0, 100)
-        # plt.subplot(211)
+        PLT_SLOPE = False
+        if PLT_SLOPE: plt.subplot(211)
         plt.xlim(x_lim)
+        plt.ylim(0, .25)
         plt.plot(*np.flip(material_ratio), 'b')
         plt.plot(*Rk_line, 'r--')
-        """ plt.subplot(212)
-        plt.xlim(x_lim)
-        plt.ylim(-.01, 0)
-        plt.plot(*slope, 'r') """
+        if PLT_SLOPE: 
+            plt.subplot(212)
+            plt.xlim(x_lim)
+            plt.ylim(-.01, 0)
+            plt.plot(mr_slope_x, mr_slope_y, 'r')
         plt.show()
 
     def __str__(self):
@@ -156,5 +150,5 @@ if __name__ == "__main__":
     long_cutoff = 0.8
     surface_texture = SurfaceTexture(data, short_cutoff, long_cutoff)
     print(surface_texture)
+    surface_texture.plot_roughness()
     #surface_texture.plot_roughness(y_lim=(-1.5, 0.5))
-    surface_texture.material_ratio(1000, 5, 5)
