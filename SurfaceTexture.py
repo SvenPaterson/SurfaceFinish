@@ -188,6 +188,6 @@ if __name__ == "__main__":
     data = "example_trace.txt"
     short_cutoff = 2.5 / 1000
     long_cutoff = 0.8
-    surface_texture = SurfaceTexture(data, short_cutoff, long_cutoff, order=3)
+    surface_texture = SurfaceTexture(data, short_cutoff, long_cutoff, order=2)
     print(surface_texture)
     surface_texture.material_ratio(1000, Pk_Offset=0.01, Vy_Offset=0.01)
