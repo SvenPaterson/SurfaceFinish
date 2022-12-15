@@ -4,11 +4,29 @@ import matplotlib.pyplot as plt
 from scipy import signal, optimize
 
 class SurfaceTexture():
-    def __init__(self, raw_data, short_cutoff, long_cutoff):
+    def __init__(self, raw_data: str, short_cutoff: int, 
+                 long_cutoff: float, order=1):
+        """ Process surface texture data from Taylor Hobson Talysurf.
+            Currently roughness parameters are calculated on init. Methods can be
+            called to plot roughness and material ratio properties.
+
+        Args:
+            raw_data (str):        Input is .txt file from Taylor Hobson Talysurf, 
+                                   1st column is x, 2nd column is y
+            short_cutoff (_type_): short wave cutoff in micron, default is 8 micron
+            long_cutoff (_type_):  long wave cutoff in mm, default is 0.8mm
+            order (int, optional): Determines order of least mean squares regression 
+                                   to remove initial form for trace if, for example, 
+                                   the measured surface is sloped, curved etc.
+                                   Defaults to 1 (i.e. fit trace to line of y = mx + b).
+        """
         self.raw_data = raw_data
         self.short_cutoff = short_cutoff
         self.long_cutoff = long_cutoff
         self.primary = np.loadtxt(self.raw_data, delimiter=",", unpack=True)
+        if order: #for LMS regression, flatten trace first
+            self.order = order
+            self.primary = self.LMS_Regr(self.primary)
         
         # calc sampling frequency
         self.Fs = 1 / self.primary[0][1] - self.primary[0][0]
@@ -35,6 +53,31 @@ class SurfaceTexture():
         self.params['Rku'] = (sum([x ** 4 for x in self.roughness[1]]) / \
                              ((self.params['Rq'][0] ** 4) * len_wav_x), "")
         self.params['Rt'] = (max(self.roughness[1]) - min(self.roughness[1]), "μm")
+
+    def LMS_Regr(self, func):
+
+        if self.order < 1 or self.order > 3:
+            raise ValueError("order must be 1, 2 or 3")
+        def first_order_func(x, a, b):
+            return a * x + b
+        def second_order_func(x, a, b, c):
+            return a * x ** 2 + b * x + c
+        def third_order_func(x, a, b, c, d):
+            return a * x ** 3 + b * x ** 2 + c * x + d
+        case = {1: first_order_func, 2: second_order_func, 3: third_order_func}
+        func = case[self.order]
+        
+        x = self.primary[0]
+        y = self.primary[1]
+        popt, pcov = optimize.curve_fit(func, x, y)
+        # print(popt)
+        # print(pcov)
+        plt.plot(x, func(x, *popt), 'r-')
+        #          label='fit: a=%5.10f, b=%5.10f' % tuple(popt))
+        plt.plot(x, y, 'b-', label='data')
+        plt.legend()
+        plt.show()
+        return x, y - func(x, *popt)
 
     def gauss_filt(self, data, cutoff):
         sigma = self.Fs / (2 * np.pi * cutoff)
@@ -125,7 +168,7 @@ class SurfaceTexture():
         PLT_SLOPE = False
         if PLT_SLOPE: plt.subplot(211)
         plt.xlim(x_lim)
-        plt.ylim(0, .25)
+        #plt.ylim(0, .25)
         plt.plot(*np.flip(material_ratio), 'b')
         plt.plot(*Rk_line, 'r--')
         if PLT_SLOPE: 
@@ -148,7 +191,6 @@ if __name__ == "__main__":
     data = "example_trace.txt"
     short_cutoff = 2.5 / 1000
     long_cutoff = 0.8
-    surface_texture = SurfaceTexture(data, short_cutoff, long_cutoff)
+    surface_texture = SurfaceTexture(data, short_cutoff, long_cutoff, order=3)
     print(surface_texture)
-    surface_texture.plot_roughness()
-    #surface_texture.plot_roughness(y_lim=(-1.5, 0.5))
+    surface_texture.material_ratio(1000, Pk_Offset=0.01, Vy_Offset=0.01)
