@@ -87,10 +87,6 @@ class SurfaceTexture():
         return len(window)//2, np.convolve(window, data, mode="valid")
     
     def plot_roughness(self, y_lim=None):
-        x_lim = (self.primary[0][0], self.primary[0][-1])
-        print(f'x_lim = {x_lim}')
-        
-
         fig, axs = plt.subplots(2, 1, figsize=(9, 4))
         
         # plot primary and waviness together
@@ -104,16 +100,18 @@ class SurfaceTexture():
                 f"{self.short_cutoff*1000}μm"
         axs[1].set_title(title)
 
+        # set x and y limits
+        x_lim = (self.primary[0][0], self.primary[0][-1])
         for a in axs:
             a.set_xlabel("size, mm")
             a.set_ylabel("height, μm")
             a.set_xlim(x_lim)
             if y_lim: a.set_ylim(y_lim)
 
+        # add R-Parameters to plot
         p = 'ISO 21290-2:2021\n'
         for key in self.params:
             p += f"{key} = {self.params[key][0]:.3f}{self.params[key][1]}\n"
-
         fig.text(0.05, 0.05, p, 
                     transform=axs[1].transAxes, fontsize=8,
                     verticalalignment='bottom',
@@ -124,16 +122,16 @@ class SurfaceTexture():
         plt.show()
 
     def material_ratio(self, samples, Pk_Offset = 0.01, Vy_Offset = 0.01):
+        PLT_SLOPE = True # do you want to plot the slope of the material ratio?
         # should have reviewed ISO 21920-2:2021 before writing this!
         if 0 < Pk_Offset < .25 and 0 < Vy_Offset < .25:
             pass
         else:
             raise ValueError("Pk_Offset and Vy_Offset must be between 0 and 0.25")
 
-        print(f'Pk_Offset = {Pk_Offset}, Vy_Offset = {Vy_Offset}')
+        # calculate material ratio
         peak = max(self.roughness[1]) * (1 - Pk_Offset)
         valley = min(self.roughness[1]) * (1 - Vy_Offset)
-        
         material_ratio = np.zeros((2, samples))
         for i in range(samples):
             eval_line = peak - valley / samples * i
@@ -144,6 +142,7 @@ class SurfaceTexture():
             material_ratio[0][i] = eval_line + valley
             material_ratio[1][i] = 100 * material / len(self.roughness[1])
 
+        # calculate slope of material ratio
         dx = 50 # for finding df/dx
         mr_slope_x, mr_slope_y = np.zeros(samples - dx), np.zeros(samples - dx)
         for i in range(samples - dx):
@@ -152,7 +151,7 @@ class SurfaceTexture():
                 (material_ratio[0][i] - material_ratio[0][i + dx]) / \
                 (material_ratio[1][i] - material_ratio[1][i + dx])
 
-        # Find Rk params
+        # Find location of minimum slope and Rk params at that point
         index_max = max(range(100, len(mr_slope_y)-100), key=mr_slope_y.__getitem__)
         Rk_slope = mr_slope_y[index_max]
         Rk_loc = np.where(material_ratio[1] == mr_slope_x[index_max])
@@ -163,12 +162,10 @@ class SurfaceTexture():
         Rk_line = (np.linspace(0, 100, 100), 
                   Rk_slope * np.linspace(0, 100, 100) + b)
 
-        print(f'Rk_point = {Rk_point}, Rk_slope = {Rk_slope}')
-        x_lim = (0, 100)
-        PLT_SLOPE = False
+        # plot material ratio and slope
         if PLT_SLOPE: plt.subplot(211)
+        x_lim = (0, 100)
         plt.xlim(x_lim)
-        #plt.ylim(0, .25)
         plt.plot(*np.flip(material_ratio), 'b')
         plt.plot(*Rk_line, 'r--')
         if PLT_SLOPE: 
