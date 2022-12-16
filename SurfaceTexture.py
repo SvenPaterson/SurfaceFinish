@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.ticker import AutoMinorLocator 
 
 from scipy import signal, optimize
 
@@ -13,8 +14,8 @@ class SurfaceTexture():
         Args:
             raw_data (str):        Input is .txt file from Taylor Hobson Talysurf, 
                                    1st column is x, 2nd column is y
-            short_cutoff (_type_): short wave cutoff in micron, default is 8 micron
-            long_cutoff (_type_):  long wave cutoff in mm, default is 0.8mm
+            short_cutoff (int): short wave cutoff in micron, default is 8 micron
+            long_cutoff (float):  long wave cutoff in mm, default is 0.8mm
             order (int, optional): Determines order of least mean squares regression 
                                    to remove initial form for trace if, for example, 
                                    the measured surface is sloped, curved etc.
@@ -45,14 +46,16 @@ class SurfaceTexture():
         len_wav_x = len(wav_x)
 
         self.params = {}
-        self.params['Ra'] = (sum(map(abs, self.roughness[1])) / len_wav_x, "μm")
+        self.params['Ra'] = (sum(map(abs, self.roughness[1])) / len_wav_x, 
+                            "μm")
         self.params['Rq'] = (np.sqrt(sum(map(np.square, self.roughness[1]))
                             / len_wav_x), "μm")
-        self.params['Rsk'] = (sum([x ** 3 for x in self.roughness[1]]) / \
+        self.params['Rsk'] = (sum([x ** 3 for x in self.roughness[1]]) /\
                              ((self.params['Rq'][0] ** 3) * len_wav_x), "")
-        self.params['Rku'] = (sum([x ** 4 for x in self.roughness[1]]) / \
+        self.params['Rku'] = (sum([x ** 4 for x in self.roughness[1]]) /\
                              ((self.params['Rq'][0] ** 4) * len_wav_x), "")
-        self.params['Rt'] = (max(self.roughness[1]) - min(self.roughness[1]), "μm")
+        self.params['Rt'] = (max(self.roughness[1]) - min(self.roughness[1]), 
+                            "μm")
 
     def LMS_Regr(self, func):
 
@@ -72,8 +75,12 @@ class SurfaceTexture():
         popt, pcov = optimize.curve_fit(func, x, y)
         # print(popt)
         # print(pcov)
-        plt.plot(x, func(x, *popt), 'r-')
-        #          label='fit: a=%5.10f, b=%5.10f' % tuple(popt))
+        if self.order == 1:
+            plt.plot(x, func(x, *popt), 'r-',
+                    label='fit: a=%5.10f, b=%5.10f' % tuple(popt))
+        else:
+            plt.plot(x, func(x, *popt), 'r-')
+        plt.title("Initial Profile Leveling")
         plt.plot(x, y, 'b-', label='data')
         plt.legend()
         plt.show()
@@ -81,7 +88,7 @@ class SurfaceTexture():
 
     def gauss_filt(self, data, cutoff):
         sigma = self.Fs / (2 * np.pi * cutoff)
-        window = signal.windows.gaussian(self.Fs * cutoff, sigma) / \
+        window = signal.windows.gaussian(self.Fs * cutoff, sigma) /\
                  (sigma * np.sqrt(2 * np.pi))
         window = [x for x in window if x > 0]
         return len(window)//2, np.convolve(window, data, mode="valid")
@@ -92,14 +99,16 @@ class SurfaceTexture():
         # plot primary and waviness together
         axs[0].plot(*self.primary, linewidth=0.5, color="blue")
         axs[0].plot(*self.waviness, linewidth=0.5, color="red")
-        axs[0].set_title(f"Primary + Waviness, λc = {self.long_cutoff}mm")
+        axs[0].set_title(f"Primary + Waviness, λc/s = {self.long_cutoff}mm") +\
+                         f"{self.short_cutoff*1000}μm"
         
         # plot roughness
         axs[1].plot(*self.roughness, linewidth=0.5, color="green")
-        title = f"Roughness, λc/s = {self.long_cutoff}mm " + \
+        title = f"Roughness, λc/s = {self.long_cutoff}mm " +\
                 f"{self.short_cutoff*1000}μm"
         axs[1].set_title(title)
 
+        minor_locator = AutoMinorLocator(2)
         # set x and y limits
         x_lim = (self.primary[0][0], self.primary[0][-1])
         for a in axs:
@@ -107,6 +116,16 @@ class SurfaceTexture():
             a.set_ylabel("height, μm")
             a.set_xlim(x_lim)
             if y_lim: a.set_ylim(y_lim)
+            a.axhline(0, color="black", linewidth=0.5)
+            a.grid(True, which='both',
+                   axis='both',
+                   linewidth=0.5,
+                   linestyle=(0, (5, 10)),
+                   color='grey', 
+                   alpha=0.5)
+            #a.minorticks_on()
+            a.yaxis.set_minor_locator(minor_locator)
+            a.xaxis.set_minor_locator(minor_locator)
 
         # add R-Parameters to plot
         p = 'ISO 21290-2:2021\n'
@@ -123,7 +142,9 @@ class SurfaceTexture():
 
     def material_ratio(self, samples, Pk_Offset = 0.01, Vy_Offset = 0.01):
         PLT_SLOPE = True # do you want to plot the slope of the material ratio?
+
         # should have reviewed ISO 21920-2:2021 before writing this!
+        # see Secton 4.5.1.3 and Annex C for appropriate calculation
         if 0 < Pk_Offset < .25 and 0 < Vy_Offset < .25:
             pass
         else:
@@ -148,11 +169,12 @@ class SurfaceTexture():
         for i in range(samples - dx):
             mr_slope_x[i] = material_ratio[1][i + dx//2]
             mr_slope_y[i] = \
-                (material_ratio[0][i] - material_ratio[0][i + dx]) / \
+                (material_ratio[0][i] - material_ratio[0][i + dx]) /\
                 (material_ratio[1][i] - material_ratio[1][i + dx])
 
         # Find location of minimum slope and Rk params at that point
-        index_max = max(range(100, len(mr_slope_y)-100), key=mr_slope_y.__getitem__)
+        index_max = max(range(100, len(mr_slope_y)-100),
+                        key=mr_slope_y.__getitem__)
         Rk_slope = mr_slope_y[index_max]
         Rk_loc = np.where(material_ratio[1] == mr_slope_x[index_max])
         Rk_point = (mr_slope_x[index_max], material_ratio[0][Rk_loc])
@@ -176,7 +198,7 @@ class SurfaceTexture():
         plt.show()
 
     def __str__(self):
-        p = f"Processed {self.raw_data} with λc = {self.long_cutoff}mm " + \
+        p = f"Processed {self.raw_data} with λc = {self.long_cutoff}mm " +\
             f"and λc/s = {self.short_cutoff*1000}μm\n\nParam\tValue"
         for key in self.params:
             p += f"\n{key}:\t{self.params[key][0]:.3f}{self.params[key][1]}"
@@ -185,9 +207,10 @@ class SurfaceTexture():
 
 
 if __name__ == "__main__":
-    data = "example_trace.txt"
+    data = "chrome_example\chrome_rod.txt"
     short_cutoff = 2.5 / 1000
     long_cutoff = 0.8
     surface_texture = SurfaceTexture(data, short_cutoff, long_cutoff, order=2)
     print(surface_texture)
-    surface_texture.material_ratio(1000, Pk_Offset=0.01, Vy_Offset=0.01)
+    #surface_texture.material_ratio(1000, Pk_Offset=0.01, Vy_Offset=0.01)
+    surface_texture.plot_roughness(y_lim=(-1.27, 1.27))
