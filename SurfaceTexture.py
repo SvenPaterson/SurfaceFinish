@@ -1,12 +1,27 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.ticker import AutoMinorLocator 
+import matplotlib as mpl
 
+from matplotlib.ticker import AutoMinorLocator 
 from scipy import signal, optimize
+from functools import wraps
+
+import time
 
 class SurfaceTexture():
+    
+    def timeit(method):
+        @wraps(method)
+        def timed(*args, **kw):
+            ts = time.time()
+            result = method(*args, **kw)
+            te = time.time()
+            print(f"{method.__name__} took {te-ts:.3f} seconds")
+            return result
+        return timed
+
     def __init__(self, raw_data: str, short_cutoff: int, 
-                 long_cutoff: float, order=1):
+                 long_cutoff: float, order=1, units='mm', **kwargs):
         """ Process surface texture data from Taylor Hobson Talysurf.
             Currently roughness parameters are calculated on init. Methods can be
             called to plot roughness and material ratio properties.
@@ -20,93 +35,114 @@ class SurfaceTexture():
                                    to remove initial form for trace if, for example, 
                                    the measured surface is sloped, curved etc.
                                    Defaults to 1 (i.e. fit trace to line of y = mx + b).
+                                   Set to 0 to skip leveling.
+            **kwargs:              
+                PLOT_LEVEL
+                PLOT_MR
+                PLOT_ROUGHNESS
+                PLOT_ALL
         """
+
+        kwargs.setdefault('PLOT_LEVEL', False)
+        kwargs.setdefault('PLOT_MR', False)
+        kwargs.setdefault('PLOT_ROUGHNESS', False)
+        kwargs.setdefault('PLOT_ALL', False)
+
+        self.units = units
         self.raw_data = raw_data
         self.short_cutoff = short_cutoff
         self.long_cutoff = long_cutoff
         self.primary = np.loadtxt(self.raw_data, delimiter=",", unpack=True)
-        if order: #for LMS regression, flatten trace first
+
+        # if profile leveling is called for then fit to line/curve
+        if order: 
+            if order > 3:
+                raise ValueError("order must be 1, 2 or 3 (0 to skip leveling)")
             self.order = order
-            self.primary = self.LMS_Regr(self.primary)
-        
+            def first_order_func(x, a, b):
+                return a * x + b
+            def second_order_func(x, a, b, c):
+                return a * x ** 2 + b * x + c
+            def third_order_func(x, a, b, c, d):
+                return a * x ** 3 + b * x ** 2 + c * x + d
+            case = {1: first_order_func,
+                    2: second_order_func,
+                    3: third_order_func}
+            func = case[self.order]
+
+            x = self.primary[0]
+            y = self.primary[1]
+            popt, _ = optimize.curve_fit(func, x, y)
+            if kwargs['PLOT_LEVEL'] or kwargs['PLOT_ALL']:
+                if self.order == 1:
+                    plt.plot(x, func(x, *popt), 'r-',
+                            label='fit: a=%5.10f, b=%5.10f' % tuple(popt))
+                else:
+                    plt.plot(x, func(x, *popt), 'r-')
+                plt.title("Initial Profile Leveling")
+                plt.plot(x, y, 'b-', label='data')
+                plt.legend()
+                plt.show()
+            self.primary = np.vstack((np.array(x),
+                                      np.array(y - func(x, *popt))))
+
+
         # calc sampling frequency
         self.Fs = 1 / self.primary[0][1] - self.primary[0][0]
+
+        def gauss_filt(data, cutoff):
+            sigma = self.Fs / (2 * np.pi * cutoff)
+            window = signal.windows.gaussian(self.Fs * cutoff, sigma) /\
+                    (sigma * np.sqrt(2 * np.pi))
+            window = [x for x in window if x > 0]
+            return len(window)//2, np.convolve(window, data, mode="valid")
+
         # filter primary using short wave cutoff
-        prim_buff, denoised_primary = self.gauss_filt(self.primary[1],
-                                                      1 / self.short_cutoff)
+        prim_buff, denoised_primary = gauss_filt(self.primary[1],
+                                                 1 / self.short_cutoff)
         # filter out wavinesss using long wave cutoff                                          
-        wav_buff, waviness = self.gauss_filt(denoised_primary,
-                                         1 / self.long_cutoff)
+        wav_buff, waviness = gauss_filt(denoised_primary, 1 / self.long_cutoff)
         wav_x = self.primary[0][prim_buff:-prim_buff+1][wav_buff:-wav_buff+1]
-  
-        self.roughness = [wav_x, denoised_primary[wav_buff:-wav_buff+1]
-                          - waviness]
-        self.waviness = [wav_x, waviness]
+        self.roughness = np.vstack((wav_x,
+                                    denoised_primary[wav_buff:-wav_buff+1]
+                                    - waviness))
+        self.waviness = np.vstack((wav_x, waviness))
+
         # generate roughness parameters
         len_wav_x = len(wav_x)
-
-        self.params = {}
-        self.params['Ra'] = (sum(map(abs, self.roughness[1])) / len_wav_x, 
-                            "μm")
-        self.params['Rq'] = (np.sqrt(sum(map(np.square, self.roughness[1]))
+        self.R_params = {}
+        self.R_params['Ra'] = (sum(map(abs, self.roughness[1]))
+                            / len_wav_x, "μm")
+        self.R_params['Rq'] = (np.sqrt(sum(map(np.square, self.roughness[1]))
                             / len_wav_x), "μm")
-        self.params['Rsk'] = (sum([x ** 3 for x in self.roughness[1]]) /\
-                             ((self.params['Rq'][0] ** 3) * len_wav_x), "")
-        self.params['Rku'] = (sum([x ** 4 for x in self.roughness[1]]) /\
-                             ((self.params['Rq'][0] ** 4) * len_wav_x), "")
-        self.params['Rt'] = (max(self.roughness[1]) - min(self.roughness[1]), 
+        self.R_params['Rsk'] = (sum([x ** 3 for x in self.roughness[1]]) /
+                             ((self.R_params['Rq'][0] ** 3) * len_wav_x), "")
+        self.R_params['Rku'] = (sum([x ** 4 for x in self.roughness[1]]) /
+                             ((self.R_params['Rq'][0] ** 4) * len_wav_x), "")
+        self.R_params['Rt'] = (max(self.roughness[1]) - min(self.roughness[1]), 
                             "μm")
-
-    def LMS_Regr(self, func):
-
-        if self.order < 1 or self.order > 3:
-            raise ValueError("order must be 1, 2 or 3")
-        def first_order_func(x, a, b):
-            return a * x + b
-        def second_order_func(x, a, b, c):
-            return a * x ** 2 + b * x + c
-        def third_order_func(x, a, b, c, d):
-            return a * x ** 3 + b * x ** 2 + c * x + d
-        case = {1: first_order_func, 2: second_order_func, 3: third_order_func}
-        func = case[self.order]
         
-        x = self.primary[0]
-        y = self.primary[1]
-        popt, pcov = optimize.curve_fit(func, x, y)
-        # print(popt)
-        # print(pcov)
-        if self.order == 1:
-            plt.plot(x, func(x, *popt), 'r-',
-                    label='fit: a=%5.10f, b=%5.10f' % tuple(popt))
-        else:
-            plt.plot(x, func(x, *popt), 'r-')
-        plt.title("Initial Profile Leveling")
-        plt.plot(x, y, 'b-', label='data')
-        plt.legend()
-        plt.show()
-        return x, y - func(x, *popt)
+        if kwargs['PLOT_ROUGHNESS'] or kwargs['PLOT_ALL']:
+            self.plot_roughness()
 
-    def gauss_filt(self, data, cutoff):
-        sigma = self.Fs / (2 * np.pi * cutoff)
-        window = signal.windows.gaussian(self.Fs * cutoff, sigma) /\
-                 (sigma * np.sqrt(2 * np.pi))
-        window = [x for x in window if x > 0]
-        return len(window)//2, np.convolve(window, data, mode="valid")
-    
+        if kwargs['PLOT_MR'] or kwargs['PLOT_ALL']:
+            self.plot_material_ratio()
+
     def plot_roughness(self, y_lim=None):
         fig, axs = plt.subplots(2, 1, figsize=(9, 4))
         
         # plot primary and waviness together
         axs[0].plot(*self.primary, linewidth=0.5, color="blue")
         axs[0].plot(*self.waviness, linewidth=0.5, color="red")
-        axs[0].set_title(f"Primary + Waviness, λc/s = {self.long_cutoff}mm") +\
-                         f"{self.short_cutoff*1000}μm"
+        PW_title = f"Primary + Waviness, λc/s = {self.long_cutoff}mm " +\
+                   f"{self.short_cutoff*1000}μm"
+        axs[0].set_title(PW_title)
         
         # plot roughness
         axs[1].plot(*self.roughness, linewidth=0.5, color="green")
-        title = f"Roughness, λc/s = {self.long_cutoff}mm " +\
+        R_title = f"Roughness, λc/s = {self.long_cutoff}mm " +\
                 f"{self.short_cutoff*1000}μm"
-        axs[1].set_title(title)
+        axs[1].set_title(R_title)
 
         minor_locator = AutoMinorLocator(2)
         # set x and y limits
@@ -129,9 +165,9 @@ class SurfaceTexture():
 
         # add R-Parameters to plot
         p = 'ISO 21290-2:2021\n'
-        for key in self.params:
-            p += f"{key} = {self.params[key][0]:.3f}{self.params[key][1]}\n"
-        fig.text(0.05, 0.05, p, 
+        for key in self.R_params:
+            p += f"{key} = {self.R_params[key][0]:.3f}{self.R_params[key][1]}\n"
+        fig.text(0.02, 0.05, p, 
                     transform=axs[1].transAxes, fontsize=8,
                     verticalalignment='bottom',
                     bbox=dict(boxstyle='round', facecolor='wheat', 
@@ -140,7 +176,111 @@ class SurfaceTexture():
         plt.tight_layout()
         plt.show()
 
-    def material_ratio(self, samples, Pk_Offset = 0.01, Vy_Offset = 0.01):
+    @timeit
+    def get_material_ratio(self, samples=2000, Pk_Offset=0.01, Vy_Offset=0.01):
+        self.mr_params = {}
+        self.Pk_Offset, self.Vy_Offset = Pk_Offset, Vy_Offset
+
+        # sort the uniformly sampled profile in descending order
+        self.material_ratio = np.sort(self.roughness[1])[::-1]
+        interpolated_material_ratio = np.zeros((2, samples))
+
+        # the sampling distance
+        deltaX = self.material_ratio.size / samples
+        for i in range(samples):
+            # find the index of the profile that is closest to the 
+            # interpolated value
+            index = int(i * deltaX)
+            interpolated_material_ratio[0][i] = 100 * i / samples
+            interpolated_material_ratio[1][i] = self.material_ratio[index]
+        self.material_ratio = interpolated_material_ratio
+
+        # calc best fit straight line which includes 40% of measured points
+        delta40 = int(0.4 * samples)
+        bf40_grad = float('inf') # best fit gradient of 40% kernel
+        for i in range(samples - delta40):
+            x = self.material_ratio[0][i:i + delta40]
+            y = self.material_ratio[1][i:i + delta40]
+            # use least square line instead of secant
+            m, c = np.polyfit(x, y, 1)
+            if abs(m) < bf40_grad:
+                bf40_grad = abs(m)
+                self.bf40_eq = (m, c)
+
+        # y = mx + c
+        self.b40at100 = self.bf40_eq[0] * 100 + self.bf40_eq[1]
+        self.mr_params['Rvkx'] = self.b40at100 - self.material_ratio[1][-1] 
+        self.mr_params['Rk'] = self.bf40_eq[1] - self.b40at100
+        # intersection of self.roughness and best fit line
+        self.mr_params['Rpkx'] = self.material_ratio[1][0] - self.bf40_eq[1]
+
+        self.mr_params['Rak1'] = 0
+        self.mr_params['Rak2'] = 0
+        for i, h in enumerate(self.material_ratio[1]):
+            if h < self.bf40_eq[1]:
+                self.mr_params['Rmrk1'] = self.material_ratio[0][i]
+                self.Rmrk1_y = self.material_ratio[1][i]
+                self.mr_params['Rak1'] += self.material_ratio[1][i]
+                break
+        for i, h in enumerate(self.material_ratio[1][::-1]):
+            if h > self.b40at100:
+                self.mr_params['Rmrk2'] = self.material_ratio[0][::-1][i]
+                self.Rmrk2_y = self.material_ratio[1][::-1][i]
+                self.mr_params['Rak2'] += self.material_ratio[1][::-1][i]
+                break
+        self.mr_params['Rak2'] = abs(self.mr_params['Rak2'])
+
+
+    def plot_material_ratio(self):
+        self.get_material_ratio()
+        
+        fig, axs = plt.subplots(1, 2, figsize=(9, 4))
+        # plot roughness
+        axs[0].plot(*self.roughness, linewidth=0.5, color="blue")
+        axs[0].set_xlim(self.roughness[0][0], self.roughness[0][-1])
+        # plot material ratio
+        axs[1].plot(*self.material_ratio, color="red")
+        x = np.linspace(0, 100, 100)
+        y = self.bf40_eq[0] * x + self.bf40_eq[1]
+        axs[1].plot(x, y, color="green", linewidth=0.5)
+        axs[1].set_xlim(0, 100)
+        #plot a dot at Rmrk1 & Rmrk2
+        axs[1].plot(self.mr_params['Rmrk1'], self.Rmrk1_y, 'x', color="green")
+        axs[1].plot(self.mr_params['Rmrk2'], self.Rmrk2_y, 'x', color="green")
+
+        for a in axs:
+            a.set_ylim(round(min(self.material_ratio[1]) - .2, 2), 
+                       round(max(self.material_ratio[1]) + .2, 2))
+            a.axhline(0, color="black", linewidth=0.5)
+            a.plot(a.get_xlim(), [self.bf40_eq[1], self.bf40_eq[1]], '--',
+                    color="green", linewidth=0.5)
+            a.plot(a.get_xlim(), [self.b40at100, self.b40at100], '--',
+                    color="green", linewidth=0.5)
+            a.minorticks_on()
+
+        # add Rmr-Parameters to plot
+        params = ['Rpkx', 'Rk', 'Rvkx']
+        p = 'ISO 21290-2:2021\n'
+        for key in params:
+            p += f"{key} = {self.mr_params[key]:.3f}\n"
+        params = ['Rmrk1', 'Rmrk2']
+        for key in params:
+            p += f"{key} = {self.mr_params[key]:.1f}%\n"
+        params = ['Rak1', 'Rak2']
+        for key in params:
+            p += f"{key} = {self.mr_params[key]:.3f} μm^2\n"
+        axs[1].text(0.02, 0.05, p[:-1], 
+                    transform=axs[1].transAxes, fontsize=8,
+                    verticalalignment='bottom',
+                    bbox=dict(boxstyle='round', facecolor='wheat', 
+                    alpha=0.5))
+
+        plt.title("Material Ratio")
+        plt.show()
+
+    @timeit
+    def old_material_ratio(self, samples, Pk_Offset=0.01, Vy_Offset=0.01,
+                           plot_flag=False):
         PLT_SLOPE = True # do you want to plot the slope of the material ratio?
 
         # should have reviewed ISO 21920-2:2021 before writing this!
@@ -172,7 +312,7 @@ class SurfaceTexture():
                 (material_ratio[0][i] - material_ratio[0][i + dx]) /\
                 (material_ratio[1][i] - material_ratio[1][i + dx])
 
-        # Find location of minimum slope and Rk params at that point
+        # Find location of minimum slope and mr_params['Rk'] params at that point
         index_max = max(range(100, len(mr_slope_y)-100),
                         key=mr_slope_y.__getitem__)
         Rk_slope = mr_slope_y[index_max]
@@ -184,24 +324,25 @@ class SurfaceTexture():
         Rk_line = (np.linspace(0, 100, 100), 
                   Rk_slope * np.linspace(0, 100, 100) + b)
 
-        # plot material ratio and slope
-        if PLT_SLOPE: plt.subplot(211)
-        x_lim = (0, 100)
-        plt.xlim(x_lim)
-        plt.plot(*np.flip(material_ratio), 'b')
-        plt.plot(*Rk_line, 'r--')
-        if PLT_SLOPE: 
-            plt.subplot(212)
+        if plot_flag:
+            # plot material ratio and slope
+            if PLT_SLOPE: plt.subplot(211)
+            x_lim = (0, 100)
             plt.xlim(x_lim)
-            plt.ylim(-.01, 0)
-            plt.plot(mr_slope_x, mr_slope_y, 'r')
-        plt.show()
+            plt.plot(*np.flip(material_ratio), 'b')
+            plt.plot(*Rk_line, 'r--')
+            if PLT_SLOPE: 
+                plt.subplot(212)
+                plt.xlim(x_lim)
+                plt.ylim(-.01, 0)
+                plt.plot(mr_slope_x, mr_slope_y, 'r')
+            plt.show()
 
     def __str__(self):
         p = f"Processed {self.raw_data} with λc = {self.long_cutoff}mm " +\
             f"and λc/s = {self.short_cutoff*1000}μm\n\nParam\tValue"
-        for key in self.params:
-            p += f"\n{key}:\t{self.params[key][0]:.3f}{self.params[key][1]}"
+        for key in self.R_params:
+            p += f"\n{key}:\t{self.R_params[key][0]:.3f}{self.R_params[key][1]}"
         p += "\n"
         return p
 
@@ -210,7 +351,8 @@ if __name__ == "__main__":
     data = "chrome_example\chrome_rod.txt"
     short_cutoff = 2.5 / 1000
     long_cutoff = 0.8
-    surface_texture = SurfaceTexture(data, short_cutoff, long_cutoff, order=2)
-    print(surface_texture)
-    #surface_texture.material_ratio(1000, Pk_Offset=0.01, Vy_Offset=0.01)
-    surface_texture.plot_roughness(y_lim=(-1.27, 1.27))
+    surface_texture = SurfaceTexture(data, short_cutoff, long_cutoff, order=2, 
+                                     PLOT_MR=True)
+    #print(surface_texture)
+    # time the functions
+    #surface_texture.old_material_ratio(1000)
