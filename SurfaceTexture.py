@@ -230,6 +230,12 @@ class SurfaceTexture():
                 break
         self.mr_params['Rak2'] = abs(self.mr_params['Rak2'])
 
+        self.mr_params['Rpk'] = 2 * self.mr_params['Rak1'] / \
+                                self.mr_params['Rmrk1']
+
+        self.mr_params['Rvk'] = 2 * self.mr_params['Rak2'] / \
+                                (100 - self.mr_params['Rmrk2'])
+
 
     def plot_material_ratio(self):
         self.get_material_ratio()
@@ -238,6 +244,19 @@ class SurfaceTexture():
         # plot roughness
         axs[0].plot(*self.roughness, linewidth=0.5, color="blue")
         axs[0].set_xlim(self.roughness[0][0], self.roughness[0][-1])
+
+        # plot Rpk and Rvk lines
+        Rpk_line = self.material_ratio[1][0] - self.mr_params['Rpk']
+        Rvk_line = self.material_ratio[1][-1] + self.mr_params['Rvk']
+        
+        ## DOUBLE CHECK THIS CALCULATION ##
+        axs[0].plot([self.roughness[0][0], self.roughness[0][-1]],
+                    [Rpk_line, Rpk_line],
+                    '--', color="green", linewidth=0.5)
+        axs[0].plot([self.roughness[0][0], self.roughness[0][-1]],
+                    [Rvk_line, Rvk_line],
+                    '--', color="green", linewidth=0.5)
+
         # plot material ratio
         axs[1].plot(*self.material_ratio, color="red")
         x = np.linspace(0, 100, 100)
