@@ -177,14 +177,17 @@ class SurfaceTexture():
         plt.show()
 
     @timeit
-    def get_material_ratio(self, samples=2000, Pk_Offset=0.01, Vy_Offset=0.01):
+    def get_material_ratio(self, samples=5000, Pk_Offset=0.01, Vy_Offset=0.01):
         self.mr_params = {}
         self.Pk_Offset, self.Vy_Offset = Pk_Offset, Vy_Offset
-
+        
         # sort the uniformly sampled profile in descending order
         self.material_ratio = np.sort(self.roughness[1])[::-1]
         self.material_ratio_all = self.roughness[:, self.roughness[1].argsort()[::-1]]
-        
+        size = self.roughness[0].size
+        x = np.linspace(0, 100, size)
+        self.material_ratio_all = np.vstack((self.material_ratio_all, x))
+
         # the sampling distance
         deltaX = self.material_ratio.size / samples
         interpolated_material_ratio = np.zeros((2, samples))
@@ -209,77 +212,89 @@ class SurfaceTexture():
                 self.bf40_eq = (m, c)
 
         # y = mx + c
-        self.b40at100 = self.bf40_eq[0] * 100 + self.bf40_eq[1]
-        self.mr_params['Rvkx'] = self.b40at100 - self.material_ratio[1][-1] 
-        self.mr_params['Rk'] = self.bf40_eq[1] - self.b40at100
+        self.bf40at100 = self.bf40_eq[0] * 100 + self.bf40_eq[1]
+        self.mr_params['Rvkx'] = self.bf40at100 - self.material_ratio[1][-1] 
+        self.mr_params['Rk'] = self.bf40_eq[1] - self.bf40at100
         # intersection of self.roughness and best fit line
         self.mr_params['Rpkx'] = self.material_ratio[1][0] - self.bf40_eq[1]
 
+        # calculate Rmrk and Rak params
         self.mr_params['Rak1'] = 0
         self.mr_params['Rak2'] = 0
-                ## DOUBLE CHECK THIS CALCULATION ##
-        for i, h in enumerate(self.material_ratio[1]):
-            if h < self.bf40_eq[1]:
-                self.mr_params['Rmrk1'] = self.material_ratio[0][i]
-                self.Rmrk1_y = self.material_ratio[1][i]
-                self.mr_params['Rak1'] += (self.material_ratio[1][i]
-                                           - self.bf40_eq[1])
-                break
         self.Rak1_points = [], []
         self.Rak2_points = [], []
-        for i, h in enumerate(self.material_ratio[1][::-1]):
-            if h > self.b40at100:
-                self.mr_params['Rmrk2'] = self.material_ratio[0][::-1][i]
-                self.Rmrk2_y = self.material_ratio[1][::-1][i]
-                
+
+        # iterate from bottom of profile up to bf line x=100 intercept
+        for i, y in enumerate(self.material_ratio[1][::-1]):
+            x = self.material_ratio[0][::-1][i]
+            if y > self.bf40at100:
+                self.mr_params['Rmrk2'] = x
+                self.Rmrk2_y = y
                 break
 
         # calculate Rak values
         count = 0
-        for i, h in enumerate(self.material_ratio_all[1]):
-            x = self.material_ratio_all[0][i]
-            y = self.material_ratio_all[1][i]
-            if h > self.bf40_eq[1]:
+        self.mr_params['Rmrk1'] = 0
+        self.Rmrk1_y = 0
+        for i in range(self.material_ratio_all[1].size - 1):
+            dt = self.material_ratio_all[2][i + 1] - \
+                 self.material_ratio_all[2][i]
+            x = self.material_ratio_all[0][i]   # position
+            x_p = self.material_ratio_all[2][i] # percentage
+            y = self.material_ratio_all[1][i]   # height
+            y_1 = self.material_ratio_all[1][i + 1] # next height
+
+            if y > self.bf40_eq[1]:
                 self.Rak1_points[0].append(x)
-                self.Rak1_points[1].append(h)
-                self.mr_params['Rak1'] += (y - self.bf40_eq[1])
+                self.Rak1_points[1].append(y)
+                self.mr_params['Rak1'] += dt * ((y + y_1) / 2 - self.bf40_eq[1])
                 count += 1
             else:
+                if not self.mr_params['Rmrk1']:
+                    self.mr_params['Rmrk1'] = x_p
+                    self.Rmrk1_y = y
                 self.Rak1_points[0].append(x)
                 self.Rak1_points[1].append(np.nan)
-        self.mr_params["Rak1"] = self.mr_params["Rak1"] / \
-                                 ((count)*100/len(self.roughness[0]))
+
         count = 0
-        for i, h in enumerate(self.material_ratio_all[1][::-1]):
-            x = self.material_ratio_all[0][::-1][i]
-            y = self.material_ratio_all[1][::-1][i]
-            if h < self.b40at100:
+        self.mr_params['Rmrk2'] = 0
+        self.Rmrk2_y = 0
+        for i in range(self.material_ratio_all[1].size - 1):
+            dt = self.material_ratio_all[2][i + 1] - \
+                 self.material_ratio_all[2][i]
+            x = self.material_ratio_all[0][::-1][i]   # position
+            x_p = self.material_ratio_all[2][::-1][i] # percentage
+            y = self.material_ratio_all[1][::-1][i]   # height
+            y_1 = self.material_ratio_all[1][::-1][i + 1] # next height
+
+            if y < self.bf40at100:
                 self.Rak2_points[0].append(x)
-                self.Rak2_points[1].append(h)
-                self.mr_params['Rak2'] += (y - self.b40at100)
+                self.Rak2_points[1].append(y)
+                self.mr_params['Rak2'] -= dt * ((y + y_1) / 2 - self.bf40at100)
                 count += 1
             else:
+                if not self.mr_params['Rmrk2']:
+                    self.mr_params['Rmrk2'] = x_p
+                    self.Rmrk2_y = y
                 self.Rak2_points[0].append(x)
                 self.Rak2_points[1].append(np.nan)
-        self.mr_params["Rak2"] = self.mr_params["Rak2"] /\
-                                 ((count)*100/len(self.roughness[0]))
-        
-        print(f'Rak1: {self.mr_params["Rak1"]}')
-        print(f'Rak2: {self.mr_params["Rak2"]}')
-        
+
+        # for plotting plateau and dale regions on top of the roughness profile
         self.Rak1_points = np.asarray(self.Rak1_points)
         self.Rak2_points = np.asarray(self.Rak2_points)
         self.Rak1_points = self.Rak1_points[:, self.Rak1_points[0, :].argsort()]
         self.Rak2_points = self.Rak2_points[:, self.Rak2_points[0, :].argsort()]
 
-        self.mr_params['Rak2'] = abs(self.mr_params['Rak2'])
-
+        
         self.mr_params['Rpk'] = 2 * self.mr_params['Rak1'] / \
                                 self.mr_params['Rmrk1']
-
         self.mr_params['Rvk'] = 2 * self.mr_params['Rak2'] / \
                                 (100 - self.mr_params['Rmrk2'])
 
+        print(f'Rak1: {self.mr_params["Rak1"]:.2f}, Rmrk1: {self.mr_params["Rmrk1"]:.2f}')
+        print(f'Rak2: {self.mr_params["Rak2"]:.2f}, Rmrk2: {self.mr_params["Rmrk2"]:.2f}')
+        print(f'bf40at100: {self.bf40at100:.2f}, bf40_eq: {self.bf40_eq[1]:.2f}')
+        print(f'Rpk: {self.mr_params["Rpk"]:.2f} Rvk: {self.mr_params["Rvk"]:.2f}')
 
     def plot_material_ratio(self):
         self.get_material_ratio()
@@ -292,30 +307,30 @@ class SurfaceTexture():
         gs = axs[1, 1].get_gridspec()
         for a in axs[1,:]:
             a.set_axis_off()
-        #axbig = fig.add_subplot(gs[1, :])
-        #axbig.set_axis_off()
         
-        # plot roughness
+        # plot roughness + plateau and dale regions
         axs[0, 0].plot(*self.roughness, linewidth=0.5, color="blue")
         axs[0, 0].set_xlim(self.roughness[0][0], self.roughness[0][-1])
-        axs[0, 0].plot(*self.Rak1_points, linewidth=0.5, color="red")
-        axs[0, 0].plot(*self.Rak2_points, linewidth=0.5, color="red")
+        axs[0, 0].plot(*self.Rak1_points, linewidth=0.75, color="green")
+        axs[0, 0].plot(*self.Rak2_points, linewidth=0.75, color="green")
 
         # plot Rpk and Rvk lines
-        Rpk_line = self.material_ratio[1][0] - self.mr_params['Rpk']
-        Rvk_line = self.material_ratio[1][-1] + self.mr_params['Rvk']
-        axs[0, 0].axhline(y=Rpk_line, linestyle='--', 
-                          color="green", linewidth=0.5)
-        axs[0, 0].axhline(y=Rvk_line, linestyle='--',
-                          color="green", linewidth=0.5)
+        Rpk_line = self.Rmrk1_y + self.mr_params['Rpk']
+        Rvk_line = self.Rmrk2_y +-self.mr_params['Rvk']
+        #print(f'Rpk_line: {Rpk_line}, Rvk_line: {Rvk_line}')
+        axs[0, 0].axhline(y=Rpk_line, linestyle='dotted', 
+                          color="blue", linewidth=0.75)
+        axs[0, 0].axhline(y=Rvk_line, linestyle='dotted',
+                          color="red", linewidth=0.75)
 
         # plot material ratio
         axs[0, 1].plot(*self.material_ratio, color="red")
+        axs[0, 1].set_ylim(0, 100)
         for xlabel_i in axs[0, 1].get_yticklabels():
             xlabel_i.set_visible(False)
         x = np.linspace(0, 100, 100)
         y = self.bf40_eq[0] * x + self.bf40_eq[1]
-        axs[0, 1].plot(x, y, color="green", linewidth=0.5)
+        axs[0, 1].plot(x, y, color="blue", linewidth=0.5)
         axs[0, 1].set_xlim(0, 100)
         #plot a dot at Rmrk1 & Rmrk2
         axs[0, 1].plot(self.mr_params['Rmrk1'], self.Rmrk1_y,
@@ -331,12 +346,12 @@ class SurfaceTexture():
             # plot 40% kernel lines
             a.axhline(self.bf40_eq[1], linestyle='--',
                       color="green", linewidth=0.5)
-            a.axhline(self.b40at100, linestyle='--',
+            a.axhline(self.bf40at100, linestyle='--',
                       color="green", linewidth=0.5)
 
         # create Rmr parameters table
-        rows = ['Rpkx', 'Rk', 'Rvkx', 'Rmrk1', 'Rmrk2', 'Rak1', 'Rak2']
-        units = ['μm', 'μm', 'μm', '%', '%', 'μm * %', 'μm * %']
+        rows = ['Rpkx', 'Rpk', 'Rk', 'Rvk', 'Rvkx', 'Rmrk1', 'Rmrk2', 'Rak1', 'Rak2']
+        units = ['μm', 'μm', 'μm', 'μm', 'μm', '%', '%', 'μm.%', 'μm.%']
         columns = ['ISO 21290-2:2021 Parameter', 'Value', 'Unit']
         n_rows = len(rows)
         
@@ -424,7 +439,7 @@ class SurfaceTexture():
 
 
 if __name__ == "__main__":
-    data = "chrome_example\chrome_rod.txt"
+    data = "example_trace.txt"
     short_cutoff = 2.5 / 1000
     long_cutoff = 0.8
     surface_texture = SurfaceTexture(data, short_cutoff, long_cutoff, order=2, 
