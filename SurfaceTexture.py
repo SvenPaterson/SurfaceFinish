@@ -212,11 +212,12 @@ class SurfaceTexture():
                 self.bf40_eq = (m, c)
 
         # y = mx + c
-        self.bf40at100 = self.bf40_eq[0] * 100 + self.bf40_eq[1]
+        self.bf40at0 = self.bf40_eq[1]
+        self.bf40at100 = self.bf40_eq[0] * 100 + self.bf40at0
         self.mr_params['Rvkx'] = self.bf40at100 - self.material_ratio[1][-1] 
-        self.mr_params['Rk'] = self.bf40_eq[1] - self.bf40at100
+        self.mr_params['Rk'] = self.bf40at0 - self.bf40at100
         # intersection of self.roughness and best fit line
-        self.mr_params['Rpkx'] = self.material_ratio[1][0] - self.bf40_eq[1]
+        self.mr_params['Rpkx'] = self.material_ratio[1][0] - self.bf40at0
 
         # calculate Rmrk and Rak params
         self.mr_params['Rak1'] = 0
@@ -244,10 +245,10 @@ class SurfaceTexture():
             y = self.material_ratio_all[1][i]   # height
             y_1 = self.material_ratio_all[1][i + 1] # next height
 
-            if y > self.bf40_eq[1]:
+            if y > self.bf40at0:
                 self.Rak1_points[0].append(x)
                 self.Rak1_points[1].append(y)
-                self.mr_params['Rak1'] += dt * ((y + y_1) / 2 - self.bf40_eq[1])
+                self.mr_params['Rak1'] += dt * ((y + y_1) / 2 - self.bf40at0)
                 count += 1
             else:
                 if not self.mr_params['Rmrk1']:
@@ -293,7 +294,7 @@ class SurfaceTexture():
 
         print(f'Rak1: {self.mr_params["Rak1"]:.2f}, Rmrk1: {self.mr_params["Rmrk1"]:.2f}')
         print(f'Rak2: {self.mr_params["Rak2"]:.2f}, Rmrk2: {self.mr_params["Rmrk2"]:.2f}')
-        print(f'bf40at100: {self.bf40at100:.2f}, bf40_eq: {self.bf40_eq[1]:.2f}')
+        print(f'bf40at100: {self.bf40at100:.2f}, bf40_eq: {self.bf40at0:.2f}')
         print(f'Rpk: {self.mr_params["Rpk"]:.2f} Rvk: {self.mr_params["Rvk"]:.2f}')
 
     def plot_material_ratio(self):
@@ -329,7 +330,7 @@ class SurfaceTexture():
         for xlabel_i in axs[0, 1].get_yticklabels():
             xlabel_i.set_visible(False)
         x = np.linspace(0, 100, 100)
-        y = self.bf40_eq[0] * x + self.bf40_eq[1]
+        y = self.bf40_eq[0] * x + self.bf40at0
         axs[0, 1].plot(x, y, color="blue", linewidth=0.5)
         axs[0, 1].set_xlim(0, 100)
         #plot a dot at Rmrk1 & Rmrk2
@@ -344,7 +345,7 @@ class SurfaceTexture():
                        round(max(self.material_ratio[1]) + .2, 2))
             a.axhline(0, color="black", linewidth=0.5)
             # plot 40% kernel lines
-            a.axhline(self.bf40_eq[1], linestyle='--',
+            a.axhline(self.bf40at0, linestyle='--',
                       color="green", linewidth=0.5)
             a.axhline(self.bf40at100, linestyle='--',
                       color="green", linewidth=0.5)
