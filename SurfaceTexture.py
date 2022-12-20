@@ -1,12 +1,12 @@
+import time, os
+
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib as mpl
 
-from matplotlib.ticker import AutoMinorLocator 
+from matplotlib.ticker import AutoMinorLocator
 from scipy import signal, optimize
 from functools import wraps
-
-import time
+from blume.table import table
 
 class SurfaceTexture():
     
@@ -183,17 +183,18 @@ class SurfaceTexture():
 
         # sort the uniformly sampled profile in descending order
         self.material_ratio = np.sort(self.roughness[1])[::-1]
-        interpolated_material_ratio = np.zeros((2, samples))
-
+        self.material_ratio_all = self.roughness[:, self.roughness[1].argsort()[::-1]]
+        
         # the sampling distance
         deltaX = self.material_ratio.size / samples
+        interpolated_material_ratio = np.zeros((2, samples))
         for i in range(samples):
             # find the index of the profile that is closest to the 
             # interpolated value
             index = int(i * deltaX)
             interpolated_material_ratio[0][i] = 100 * i / samples
             interpolated_material_ratio[1][i] = self.material_ratio[index]
-        self.material_ratio = interpolated_material_ratio
+        self.material_ratio = np.asarray(interpolated_material_ratio)
 
         # calc best fit straight line which includes 40% of measured points
         delta40 = int(0.4 * samples)
@@ -216,18 +217,61 @@ class SurfaceTexture():
 
         self.mr_params['Rak1'] = 0
         self.mr_params['Rak2'] = 0
+                ## DOUBLE CHECK THIS CALCULATION ##
         for i, h in enumerate(self.material_ratio[1]):
             if h < self.bf40_eq[1]:
                 self.mr_params['Rmrk1'] = self.material_ratio[0][i]
                 self.Rmrk1_y = self.material_ratio[1][i]
-                self.mr_params['Rak1'] += self.material_ratio[1][i]
+                self.mr_params['Rak1'] += (self.material_ratio[1][i]
+                                           - self.bf40_eq[1])
                 break
+        self.Rak1_points = [], []
+        self.Rak2_points = [], []
         for i, h in enumerate(self.material_ratio[1][::-1]):
             if h > self.b40at100:
                 self.mr_params['Rmrk2'] = self.material_ratio[0][::-1][i]
                 self.Rmrk2_y = self.material_ratio[1][::-1][i]
-                self.mr_params['Rak2'] += self.material_ratio[1][::-1][i]
+                
                 break
+
+        # calculate Rak values
+        count = 0
+        for i, h in enumerate(self.material_ratio_all[1]):
+            x = self.material_ratio_all[0][i]
+            y = self.material_ratio_all[1][i]
+            if h > self.bf40_eq[1]:
+                self.Rak1_points[0].append(x)
+                self.Rak1_points[1].append(h)
+                self.mr_params['Rak1'] += (y - self.bf40_eq[1])
+                count += 1
+            else:
+                self.Rak1_points[0].append(x)
+                self.Rak1_points[1].append(np.nan)
+        self.mr_params["Rak1"] = self.mr_params["Rak1"] / \
+                                 ((count)*100/len(self.roughness[0]))
+        count = 0
+        for i, h in enumerate(self.material_ratio_all[1][::-1]):
+            x = self.material_ratio_all[0][::-1][i]
+            y = self.material_ratio_all[1][::-1][i]
+            if h < self.b40at100:
+                self.Rak2_points[0].append(x)
+                self.Rak2_points[1].append(h)
+                self.mr_params['Rak2'] += (y - self.b40at100)
+                count += 1
+            else:
+                self.Rak2_points[0].append(x)
+                self.Rak2_points[1].append(np.nan)
+        self.mr_params["Rak2"] = self.mr_params["Rak2"] /\
+                                 ((count)*100/len(self.roughness[0]))
+        
+        print(f'Rak1: {self.mr_params["Rak1"]}')
+        print(f'Rak2: {self.mr_params["Rak2"]}')
+        
+        self.Rak1_points = np.asarray(self.Rak1_points)
+        self.Rak2_points = np.asarray(self.Rak2_points)
+        self.Rak1_points = self.Rak1_points[:, self.Rak1_points[0, :].argsort()]
+        self.Rak2_points = self.Rak2_points[:, self.Rak2_points[0, :].argsort()]
+
         self.mr_params['Rak2'] = abs(self.mr_params['Rak2'])
 
         self.mr_params['Rpk'] = 2 * self.mr_params['Rak1'] / \
@@ -239,62 +283,75 @@ class SurfaceTexture():
 
     def plot_material_ratio(self):
         self.get_material_ratio()
+        fig, axs = plt.subplots(nrows=2, ncols=2,
+                                figsize=(12, 6),
+                                gridspec_kw={'width_ratios': [2, 1],
+                                             'height_ratios': [30, 1]})
+
+        # combine bottom two axes and create space for R-Parameters
+        gs = axs[1, 1].get_gridspec()
+        for a in axs[1,:]:
+            a.set_axis_off()
+        #axbig = fig.add_subplot(gs[1, :])
+        #axbig.set_axis_off()
         
-        fig, axs = plt.subplots(1, 2, figsize=(9, 4))
         # plot roughness
-        axs[0].plot(*self.roughness, linewidth=0.5, color="blue")
-        axs[0].set_xlim(self.roughness[0][0], self.roughness[0][-1])
+        axs[0, 0].plot(*self.roughness, linewidth=0.5, color="blue")
+        axs[0, 0].set_xlim(self.roughness[0][0], self.roughness[0][-1])
+        axs[0, 0].plot(*self.Rak1_points, linewidth=0.5, color="red")
+        axs[0, 0].plot(*self.Rak2_points, linewidth=0.5, color="red")
 
         # plot Rpk and Rvk lines
         Rpk_line = self.material_ratio[1][0] - self.mr_params['Rpk']
         Rvk_line = self.material_ratio[1][-1] + self.mr_params['Rvk']
-        
-        ## DOUBLE CHECK THIS CALCULATION ##
-        axs[0].plot([self.roughness[0][0], self.roughness[0][-1]],
-                    [Rpk_line, Rpk_line],
-                    '--', color="green", linewidth=0.5)
-        axs[0].plot([self.roughness[0][0], self.roughness[0][-1]],
-                    [Rvk_line, Rvk_line],
-                    '--', color="green", linewidth=0.5)
+        axs[0, 0].axhline(y=Rpk_line, linestyle='--', 
+                          color="green", linewidth=0.5)
+        axs[0, 0].axhline(y=Rvk_line, linestyle='--',
+                          color="green", linewidth=0.5)
 
         # plot material ratio
-        axs[1].plot(*self.material_ratio, color="red")
+        axs[0, 1].plot(*self.material_ratio, color="red")
+        for xlabel_i in axs[0, 1].get_yticklabels():
+            xlabel_i.set_visible(False)
         x = np.linspace(0, 100, 100)
         y = self.bf40_eq[0] * x + self.bf40_eq[1]
-        axs[1].plot(x, y, color="green", linewidth=0.5)
-        axs[1].set_xlim(0, 100)
+        axs[0, 1].plot(x, y, color="green", linewidth=0.5)
+        axs[0, 1].set_xlim(0, 100)
         #plot a dot at Rmrk1 & Rmrk2
-        axs[1].plot(self.mr_params['Rmrk1'], self.Rmrk1_y, 'x', color="green")
-        axs[1].plot(self.mr_params['Rmrk2'], self.Rmrk2_y, 'x', color="green")
+        axs[0, 1].plot(self.mr_params['Rmrk1'], self.Rmrk1_y,
+                       'x', color="green")
+        axs[0, 1].plot(self.mr_params['Rmrk2'], self.Rmrk2_y,
+                       'x', color="green")
 
-        for a in axs:
+        for a in axs[0, :]:
+            a.minorticks_on()
             a.set_ylim(round(min(self.material_ratio[1]) - .2, 2), 
                        round(max(self.material_ratio[1]) + .2, 2))
             a.axhline(0, color="black", linewidth=0.5)
-            a.plot(a.get_xlim(), [self.bf40_eq[1], self.bf40_eq[1]], '--',
-                    color="green", linewidth=0.5)
-            a.plot(a.get_xlim(), [self.b40at100, self.b40at100], '--',
-                    color="green", linewidth=0.5)
-            a.minorticks_on()
+            # plot 40% kernel lines
+            a.axhline(self.bf40_eq[1], linestyle='--',
+                      color="green", linewidth=0.5)
+            a.axhline(self.b40at100, linestyle='--',
+                      color="green", linewidth=0.5)
 
-        # add Rmr-Parameters to plot
-        params = ['Rpkx', 'Rk', 'Rvkx']
-        p = 'ISO 21290-2:2021\n'
-        for key in params:
-            p += f"{key} = {self.mr_params[key]:.3f}\n"
-        params = ['Rmrk1', 'Rmrk2']
-        for key in params:
-            p += f"{key} = {self.mr_params[key]:.1f}%\n"
-        params = ['Rak1', 'Rak2']
-        for key in params:
-            p += f"{key} = {self.mr_params[key]:.3f} μm^2\n"
-        axs[1].text(0.02, 0.05, p[:-1], 
-                    transform=axs[1].transAxes, fontsize=8,
-                    verticalalignment='bottom',
-                    bbox=dict(boxstyle='round', facecolor='wheat', 
-                    alpha=0.5))
-
-        plt.title("Material Ratio")
+        # create Rmr parameters table
+        rows = ['Rpkx', 'Rk', 'Rvkx', 'Rmrk1', 'Rmrk2', 'Rak1', 'Rak2']
+        units = ['μm', 'μm', 'μm', '%', '%', 'μm * %', 'μm * %']
+        columns = ['ISO 21290-2:2021 Parameter', 'Value', 'Unit']
+        n_rows = len(rows)
+        
+        cell_text = []
+        for i in range(n_rows):
+            cell_text.append([round(self.mr_params[rows[i]], 3), units[i]])
+        the_table = table(axs[1, 1], cellText=cell_text,
+                                 rowLabels=rows,
+                                 colLabels=columns,
+                                 loc='top',
+                                 fontsize=10)
+        
+        axs[0, 0].set_title(f"{os.path.split(self.raw_data)[1]} - Roughness")
+        axs[0, 1].set_title("Material Ratio")
+        plt.tight_layout()
         plt.show()
 
     @timeit
