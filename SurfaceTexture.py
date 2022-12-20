@@ -315,14 +315,8 @@ class SurfaceTexture():
         axs[0, 0].plot(*self.Rak1_points, linewidth=0.75, color="green")
         axs[0, 0].plot(*self.Rak2_points, linewidth=0.75, color="green")
 
-        # plot Rpk and Rvk lines
-        Rpk_line = self.Rmrk1_y + self.mr_params['Rpk']
-        Rvk_line = self.Rmrk2_y +-self.mr_params['Rvk']
+        
         #print(f'Rpk_line: {Rpk_line}, Rvk_line: {Rvk_line}')
-        axs[0, 0].axhline(y=Rpk_line, linestyle='dotted', 
-                          color="blue", linewidth=0.75)
-        axs[0, 0].axhline(y=Rvk_line, linestyle='dotted',
-                          color="red", linewidth=0.75)
 
         # plot material ratio
         axs[0, 1].plot(*self.material_ratio, color="red")
@@ -349,6 +343,11 @@ class SurfaceTexture():
                       color="green", linewidth=0.5)
             a.axhline(self.bf40at100, linestyle='--',
                       color="green", linewidth=0.5)
+            # plot Rpk and Rvk lines
+            a.axhline(y=self.Rmrk1_y + self.mr_params['Rpk'], 
+                      linestyle='dotted', color="k", linewidth=0.75)
+            a.axhline(y=self.Rmrk2_y +-self.mr_params['Rvk'],
+                      linestyle='dotted', color="k", linewidth=0.75)
 
         # create Rmr parameters table
         rows = ['Rpkx', 'Rpk', 'Rk', 'Rvk', 'Rvkx', 'Rmrk1', 'Rmrk2', 'Rak1', 'Rak2']
