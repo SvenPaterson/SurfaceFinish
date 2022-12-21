@@ -23,25 +23,27 @@ class SurfaceTexture():
     @timeit
     def __init__(self, raw_data: str, short_cutoff: int, 
                  long_cutoff: float, order=1, units='mm', **kwargs):
-        """ Process surface texture data from Taylor Hobson Talysurf.
+        """ Process surface texture data
             Currently roughness parameters are calculated on init. Methods can be
             called to plot roughness and material ratio properties.
 
         Args:
-            raw_data (str):        Input is .txt file from Taylor Hobson Talysurf, 
-                                   1st column is x, 2nd column is y
-            short_cutoff (int): short wave cutoff in micron, default is 8 micron
-            long_cutoff (float):  long wave cutoff in mm, default is 0.8mm
-            order (int, optional): Determines order of least mean squares regression 
-                                   to remove initial form for trace if, for example, 
-                                   the measured surface is sloped, curved etc.
-                                   Defaults to 1 (i.e. fit trace to line of y = mx + b).
-                                   Set to 0 to skip leveling.
+            raw_data (str):
+                Input is csv file with 2 columns, 1st column is
+                x, 2nd column is y
+            short_cutoff (int):
+                short wave cutoff in micron, default is 8 micron
+            long_cutoff (float):
+                long wave cutoff in mm, default is 0.8mm
+            order (int, optional):
+                Determines order of least mean squares regression
+                to remove initial form for trace if, for example,
+                the measured surface is sloped, curved etc.
+                Defaults to 1 (i.e. fit trace to line of y = mx + b).
+                Set to 0 to skip leveling.
             **kwargs:              
-                PLOT_LEVEL
-                PLOT_MR
-                PLOT_ROUGHNESS
-                PLOT_ALL
+                PLOT_LEVEL, PLOT_MR, PLOT_ROUGHNESS, PLOT_ALL
+                Default is False for all. Set to True to plot.
         """
 
         kwargs.setdefault('PLOT_LEVEL', False)
@@ -74,6 +76,7 @@ class SurfaceTexture():
             x = self.primary[0]
             y = self.primary[1]
             popt, _ = optimize.curve_fit(func, x, y)
+
             if kwargs['PLOT_LEVEL'] or kwargs['PLOT_ALL']:
                 if self.order == 1:
                     plt.plot(x, func(x, *popt), 'r-',
@@ -84,6 +87,7 @@ class SurfaceTexture():
                 plt.plot(x, y, 'b-', label='data')
                 plt.legend()
                 plt.show()
+            
             self.primary = np.vstack((np.array(x),
                                       np.array(y - func(x, *popt))))
 
@@ -188,7 +192,7 @@ class SurfaceTexture():
                     alpha=0.5))
 
         plt.tight_layout()
-        plt.show()
+        plt.draw()
 
     @timeit
     def get_material_ratio(self, samples=1000, Pk_Offset=0.01, Vy_Offset=0.01):
@@ -366,7 +370,7 @@ class SurfaceTexture():
                       linestyle='dotted', color="k", linewidth=0.75)
 
         # create Rmr parameters table
-        rows = ['Rpkx', 'Rpk', 'Rk', 'Rvk', 'Rvkx', 'Rmrk1', 'Rmrk2', 'Rak1', 'Rak2']
+        rows = ['Rk', 'Rpk', 'Rvk', 'Rmrk1', 'Rmrk2', 'Rak1', 'Rak2', 'Rpkx', 'Rvkx']
         units = ['μm', 'μm', 'μm', 'μm', 'μm', '%', '%', 'μm.%', 'μm.%']
         columns = ['ISO 21290-2:2021 Parameter', 'Value', 'Unit']
         n_rows = len(rows)
@@ -374,7 +378,7 @@ class SurfaceTexture():
         cell_text = []
         for i in range(n_rows):
             cell_text.append([round(self.mr_params[rows[i]], 3), units[i]])
-        the_table = table(axs[1, 1], cellText=cell_text,
+        mr_table = table(axs[1, 1], cellText=cell_text,
                                  rowLabels=rows,
                                  colLabels=columns,
                                  loc='top',
@@ -383,11 +387,11 @@ class SurfaceTexture():
         axs[0, 0].set_title(f"{os.path.split(self.raw_data)[1]} - Roughness")
         axs[0, 1].set_title("Material Ratio")
         plt.tight_layout()
-        plt.show()
+        plt.draw()
 
     def __str__(self):
-        p = f"Processed {self.raw_data} with λc = {self.long_cutoff}mm " +\
-            f"and λc/s = {self.short_cutoff*1000}μm\n\nParam\tValue"
+        p = f'\nProcessed {self.raw_data} with λc = {self.long_cutoff}mm\n' \
+            f'and λc/s = {self.short_cutoff*1000}μm\n\nParam\tValue'
         for key in self.R_params:
             p += f"\n{key}:\t{self.R_params[key][0]:.3f}{self.R_params[key][1]}"
         p += "\n"
@@ -395,11 +399,14 @@ class SurfaceTexture():
 
 
 if __name__ == "__main__":
-    data = "example_trace.txt"
+    data = "example/example_trace.txt"
     short_cutoff = 2.5 / 1000
     long_cutoff = 0.8
-    surface_texture = SurfaceTexture(data, short_cutoff, long_cutoff, order=1)
+    surface_texture = SurfaceTexture(data, short_cutoff, long_cutoff,
+                                     order=1)
     surface_texture.plot_material_ratio()
-    #print(surface_texture)
-    # time the functions
-    #surface_texture.old_material_ratio(1000)
+    surface_texture.plot_roughness()
+    print(surface_texture)
+    
+    plt.show()
+
