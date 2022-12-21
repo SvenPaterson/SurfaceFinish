@@ -20,6 +20,7 @@ class SurfaceTexture():
             return result
         return timed
 
+    @timeit
     def __init__(self, raw_data: str, short_cutoff: int, 
                  long_cutoff: float, order=1, units='mm', **kwargs):
         """ Process surface texture data from Taylor Hobson Talysurf.
@@ -88,24 +89,37 @@ class SurfaceTexture():
 
 
         # calc sampling frequency
-        self.Fs = 1 / self.primary[0][1] - self.primary[0][0]
+        T = self.primary[0][1] - self.primary[0][0]
+        self.Fs = 1 / T
 
-        def gauss_filt(data, cutoff):
+        def gauss_filter(data, cutoff):
             sigma = self.Fs / (2 * np.pi * cutoff)
             window = signal.windows.gaussian(self.Fs * cutoff, sigma) /\
                     (sigma * np.sqrt(2 * np.pi))
+            # plt.plot(window)
             window = [x for x in window if x > 0]
-            return len(window)//2, np.convolve(window, data, mode="valid")
+            # plt.plot(window, 'r', linestyle='--')
+            # plt.show()
+            return signal.fftconvolve(data, window, mode="same")
 
-        # filter primary using short wave cutoff
-        prim_buff, denoised_primary = gauss_filt(self.primary[1],
-                                                 1 / self.short_cutoff)
-        # filter out wavinesss using long wave cutoff                                          
-        wav_buff, waviness = gauss_filt(denoised_primary, 1 / self.long_cutoff)
+        # buffer used for clipping valid data
+        prim_buff = int(self.short_cutoff / (2 * T))
+        wav_buff = int(self.long_cutoff / (2 * T))
+
+        # filter primary using short wave cutoff and clip valid data
+        freq = 1 / self.short_cutoff
+        denoised_primary = gauss_filter(self.primary[1], freq)
+        denoised_primary = denoised_primary[prim_buff:-prim_buff+1]
+
+        # filter out wavinesss using long wave cutoff and clip valid data
+        freq = 1 / self.long_cutoff                                        
+        waviness = gauss_filter(denoised_primary, freq)
+        denoised_primary = denoised_primary[wav_buff:-wav_buff+1]
+        waviness = waviness[wav_buff:-wav_buff+1]
+
+        # store data in class variables
         wav_x = self.primary[0][prim_buff:-prim_buff+1][wav_buff:-wav_buff+1]
-        self.roughness = np.vstack((wav_x,
-                                    denoised_primary[wav_buff:-wav_buff+1]
-                                    - waviness))
+        self.roughness = np.vstack((wav_x, denoised_primary - waviness))
         self.waviness = np.vstack((wav_x, waviness))
 
         # generate roughness parameters
@@ -119,7 +133,7 @@ class SurfaceTexture():
                              ((self.R_params['Rq'][0] ** 3) * len_wav_x), "")
         self.R_params['Rku'] = (sum([x ** 4 for x in self.roughness[1]]) /
                              ((self.R_params['Rq'][0] ** 4) * len_wav_x), "")
-        self.R_params['Rt'] = (max(self.roughness[1]) - min(self.roughness[1]), 
+        self.R_params['Rt'] = (max(self.roughness[1]) - min(self.roughness[1]),
                             "μm")
         
         if kwargs['PLOT_ROUGHNESS'] or kwargs['PLOT_ALL']:
@@ -177,7 +191,7 @@ class SurfaceTexture():
         plt.show()
 
     @timeit
-    def get_material_ratio(self, samples=5000, Pk_Offset=0.01, Vy_Offset=0.01):
+    def get_material_ratio(self, samples=1000, Pk_Offset=0.01, Vy_Offset=0.01):
         self.mr_params = {}
         self.Pk_Offset, self.Vy_Offset = Pk_Offset, Vy_Offset
         
@@ -210,14 +224,15 @@ class SurfaceTexture():
             if abs(m) < bf40_grad:
                 bf40_grad = abs(m)
                 self.bf40_eq = (m, c)
+            if abs(m) > bf40_grad: break
 
         # y = mx + c
         self.bf40at0 = self.bf40_eq[1]
         self.bf40at100 = self.bf40_eq[0] * 100 + self.bf40at0
-        self.mr_params['Rvkx'] = self.bf40at100 - self.material_ratio[1][-1] 
+        self.mr_params['Rvkx'] = self.bf40at100 - self.material_ratio_all[1][-1] 
         self.mr_params['Rk'] = self.bf40at0 - self.bf40at100
         # intersection of self.roughness and best fit line
-        self.mr_params['Rpkx'] = self.material_ratio[1][0] - self.bf40at0
+        self.mr_params['Rpkx'] = self.material_ratio_all[1][0] - self.bf40at0
 
         # calculate Rmrk and Rak params
         self.mr_params['Rak1'] = 0
@@ -292,6 +307,7 @@ class SurfaceTexture():
         self.mr_params['Rvk'] = 2 * self.mr_params['Rak2'] / \
                                 (100 - self.mr_params['Rmrk2'])
 
+        print(f'num_data_points: {self.material_ratio_all[1].size}')
         print(f'Rak1: {self.mr_params["Rak1"]:.2f}, Rmrk1: {self.mr_params["Rmrk1"]:.2f}')
         print(f'Rak2: {self.mr_params["Rak2"]:.2f}, Rmrk2: {self.mr_params["Rmrk2"]:.2f}')
         print(f'bf40at100: {self.bf40at100:.2f}, bf40_eq: {self.bf40at0:.2f}')
@@ -369,66 +385,6 @@ class SurfaceTexture():
         plt.tight_layout()
         plt.show()
 
-    @timeit
-    def old_material_ratio(self, samples, Pk_Offset=0.01, Vy_Offset=0.01,
-                           plot_flag=False):
-        PLT_SLOPE = True # do you want to plot the slope of the material ratio?
-
-        # should have reviewed ISO 21920-2:2021 before writing this!
-        # see Secton 4.5.1.3 and Annex C for appropriate calculation
-        if 0 < Pk_Offset < .25 and 0 < Vy_Offset < .25:
-            pass
-        else:
-            raise ValueError("Pk_Offset and Vy_Offset must be between 0 and 0.25")
-
-        # calculate material ratio
-        peak = max(self.roughness[1]) * (1 - Pk_Offset)
-        valley = min(self.roughness[1]) * (1 - Vy_Offset)
-        material_ratio = np.zeros((2, samples))
-        for i in range(samples):
-            eval_line = peak - valley / samples * i
-            material = 0
-            for point in self.roughness[1]:
-                if point-valley >= eval_line:
-                    material += 1
-            material_ratio[0][i] = eval_line + valley
-            material_ratio[1][i] = 100 * material / len(self.roughness[1])
-
-        # calculate slope of material ratio
-        dx = 50 # for finding df/dx
-        mr_slope_x, mr_slope_y = np.zeros(samples - dx), np.zeros(samples - dx)
-        for i in range(samples - dx):
-            mr_slope_x[i] = material_ratio[1][i + dx//2]
-            mr_slope_y[i] = \
-                (material_ratio[0][i] - material_ratio[0][i + dx]) /\
-                (material_ratio[1][i] - material_ratio[1][i + dx])
-
-        # Find location of minimum slope and mr_params['Rk'] params at that point
-        index_max = max(range(100, len(mr_slope_y)-100),
-                        key=mr_slope_y.__getitem__)
-        Rk_slope = mr_slope_y[index_max]
-        Rk_loc = np.where(material_ratio[1] == mr_slope_x[index_max])
-        Rk_point = (mr_slope_x[index_max], material_ratio[0][Rk_loc])
-
-        # y = mx + b, b = y - mx
-        b = Rk_point[1] - Rk_slope * Rk_point[0]
-        Rk_line = (np.linspace(0, 100, 100), 
-                  Rk_slope * np.linspace(0, 100, 100) + b)
-
-        if plot_flag:
-            # plot material ratio and slope
-            if PLT_SLOPE: plt.subplot(211)
-            x_lim = (0, 100)
-            plt.xlim(x_lim)
-            plt.plot(*np.flip(material_ratio), 'b')
-            plt.plot(*Rk_line, 'r--')
-            if PLT_SLOPE: 
-                plt.subplot(212)
-                plt.xlim(x_lim)
-                plt.ylim(-.01, 0)
-                plt.plot(mr_slope_x, mr_slope_y, 'r')
-            plt.show()
-
     def __str__(self):
         p = f"Processed {self.raw_data} with λc = {self.long_cutoff}mm " +\
             f"and λc/s = {self.short_cutoff*1000}μm\n\nParam\tValue"
@@ -442,8 +398,8 @@ if __name__ == "__main__":
     data = "example_trace.txt"
     short_cutoff = 2.5 / 1000
     long_cutoff = 0.8
-    surface_texture = SurfaceTexture(data, short_cutoff, long_cutoff, order=2, 
-                                     PLOT_MR=True)
+    surface_texture = SurfaceTexture(data, short_cutoff, long_cutoff, order=1)
+    surface_texture.plot_material_ratio()
     #print(surface_texture)
     # time the functions
     #surface_texture.old_material_ratio(1000)
