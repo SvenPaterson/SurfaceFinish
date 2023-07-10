@@ -146,6 +146,9 @@ class SurfaceTexture():
         if kwargs['PLOT_MR'] or kwargs['PLOT_ALL']:
             self.plot_material_ratio()
 
+    def wear_track_depth(self):
+        return min(self.primary[1]), "μm"
+
     def plot_roughness(self, y_lim=None):
         fig, axs = plt.subplots(2, 1, figsize=(9, 4))
         
@@ -404,9 +407,11 @@ if __name__ == "__main__":
     long_cutoff = 0.8
     surface_texture = SurfaceTexture(data, short_cutoff, long_cutoff,
                                      order=1)
-    surface_texture.plot_material_ratio()
+    #surface_texture.plot_material_ratio()
     surface_texture.plot_roughness()
-    print(surface_texture)
+    surface_texture.plot_material_ratio()
+    print(surface_texture.wear_track_depth())
     
+
     plt.show()
 
