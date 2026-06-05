@@ -9,7 +9,44 @@ from scipy import signal, optimize
 from functools import wraps
 from blume.table import table
 
+from iso21920 import (
+    SETTING_CLASSES,
+    DEFAULT_SETTING_CLASS,
+    convert_mm_to,
+    get_setting_class,
+)
+
+
 class SurfaceTexture():
+
+    @staticmethod
+    def _normalize_unit(unit):
+        text = str(unit or "").strip().lower()
+        text = text.replace("μ", "u").replace("µ", "u")
+        return text
+
+    def _display_decimals(self, param, unit):
+        # Requested defaults:
+        # - micro-inch params: 1 decimal place
+        # - micro-meter params: 2 decimal places
+        # - Bearing ratio (Rmr): always 1 decimal place
+        # - Rsk: always 2 decimal places
+        if param == "Rmr":
+            return 1
+        if param == "Rsk":
+            return 2
+        norm_unit = self._normalize_unit(unit)
+        if norm_unit in {"uin", "uinch", "u-in", "u in"}:
+            return 1
+        if norm_unit in {"um", "umeter", "umetre", "u-m", "u m"}:
+            return 2
+        return 3
+
+    def format_param_value(self, param, value, unit):
+        if isinstance(value, (int, float, np.floating)):
+            decimals = self._display_decimals(param, unit)
+            return f"{float(value):.{decimals}f}"
+        return str(value)
 
     @staticmethod
     def _parse_column_selector(selector):
@@ -39,30 +76,63 @@ class SurfaceTexture():
         x_selector = cls._parse_column_selector(x_col)
         y_selector = cls._parse_column_selector(y_col)
 
-        df = pd.read_excel(raw_data, sheet_name=sheet_name)
+        # Pick the fastest available engine. ``python-calamine`` is roughly
+        # 10-50x faster than ``openpyxl`` for large numeric workbooks.
+        try:
+            import python_calamine  # noqa: F401
+            engine = "calamine"
+        except ImportError:
+            engine = "openpyxl"
+
+        # If we have integer column indexes we can ask the engine to only
+        # materialise the two columns of interest, which is dramatically
+        # faster than parsing the whole sheet.
+        usecols = None
+        if isinstance(x_selector, int) and isinstance(y_selector, int):
+            usecols = sorted({x_selector, y_selector})
+
+        read_kwargs = {"sheet_name": sheet_name, "engine": engine}
+        if usecols is not None:
+            read_kwargs["usecols"] = usecols
+
+        df = pd.read_excel(raw_data, **read_kwargs)
         if isinstance(df, dict):
             first_sheet = next(iter(df))
             df = df[first_sheet]
 
         if isinstance(x_selector, str):
             if x_selector not in df.columns:
-                raise ValueError(f"X column '{x_selector}' was not found in sheet '{sheet_name}'.")
+                raise ValueError(
+                    f"X column '{x_selector}' was not found in sheet '{sheet_name}'."
+                )
             x_series = df[x_selector]
         else:
-            x_series = df.iloc[:, x_selector]
+            # When ``usecols`` was supplied the resulting frame has the
+            # selected columns in their original order; map back via index.
+            if usecols is not None:
+                x_series = df.iloc[:, usecols.index(x_selector)]
+            else:
+                x_series = df.iloc[:, x_selector]
 
         if isinstance(y_selector, str):
             if y_selector not in df.columns:
-                raise ValueError(f"Y column '{y_selector}' was not found in sheet '{sheet_name}'.")
+                raise ValueError(
+                    f"Y column '{y_selector}' was not found in sheet '{sheet_name}'."
+                )
             y_series = df[y_selector]
         else:
-            y_series = df.iloc[:, y_selector]
+            if usecols is not None:
+                y_series = df.iloc[:, usecols.index(y_selector)]
+            else:
+                y_series = df.iloc[:, y_selector]
 
         x = x_series.to_numpy(dtype=float)
         y = y_series.to_numpy(dtype=float)
         valid = np.isfinite(x) & np.isfinite(y)
         if not np.any(valid):
-            raise ValueError("No valid numeric X/Y pairs found in the selected worksheet columns.")
+            raise ValueError(
+                "No valid numeric X/Y pairs found in the selected worksheet columns."
+            )
 
         return np.vstack((x[valid], y[valid]))
 
@@ -84,31 +154,37 @@ class SurfaceTexture():
         return timed
 
     @timeit
-    def __init__(self, raw_data: str, short_cutoff: int,
-                 long_cutoff: float, order=1,
+    def __init__(self, raw_data: str, short_cutoff=None,
+                 long_cutoff=None, order=1,
                  x_units='mm', y_units='μm',
-                 x_col=0, y_col=1, sheet_name=0, **kwargs):
-        """ Process surface texture data
-            Currently roughness parameters are calculated on init. Methods can be
-            called to plot roughness and material ratio properties.
+                 x_col=0, y_col=1, sheet_name=0,
+                 setting_class=None,
+                 **kwargs):
+        """Process a surface profile per ISO 21920-3:2021 / ISO 21920-2:2021.
+
+        The complete specification operator (S-filter, L-filter, F-operator,
+        evaluation length, sectioning) is built from the *setting class*
+        (ISO 21920-3 Table 1). The evaluation length and number of sampling
+        sections are derived from the trace length and λc:
+
+        * Default target ``nsc = 5`` sampling sections of length ``lsc = λc``.
+        * If the trace cannot accommodate 5 sections plus the filter
+          end-buffers, ``nsc`` is automatically reduced toward 1 and a
+          warning is emitted on ``self.nsc_warning``.
+        * If even one full ``λc`` section will not fit, a ``ValueError`` is
+          raised suggesting a smaller setting class.
 
         Args:
-            raw_data (str):
-                Input is csv file with 2 columns, 1st column is
-                x, 2nd column is y
-            short_cutoff (int):
-                short wave cutoff in micron, default is 8 micron
-            long_cutoff (float):
-                long wave cutoff in mm, default is 0.8mm
-            order (int, optional):
-                Determines order of least mean squares regression
-                to remove initial form for trace if, for example,
-                the measured surface is sloped, curved etc.
-                Defaults to 1 (i.e. fit trace to line of y = mx + b).
-                Set to 0 to skip leveling.
-            **kwargs:              
-                PLOT_LEVEL, PLOT_MR, PLOT_ROUGHNESS, PLOT_ALL
-                Default is False for all. Set to True to plot.
+            raw_data: 2-column data file (.txt/.csv/.xlsx).
+            short_cutoff: λs in the data's X distance unit. Overrides class.
+            long_cutoff: λc in the data's X distance unit. Overrides class.
+            order: Polynomial leveling order (0 skips, 1..3).
+            x_units / y_units: Display units for the axes.
+            x_col / y_col / sheet_name: Column / sheet selectors.
+            setting_class: ISO 21920-3 setting class name ("Sc1".."Sc5",
+                or None to default to "Sc3"). Cutoffs inherit from the class
+                unless explicitly overridden.
+            **kwargs: PLOT_LEVEL, PLOT_MR, PLOT_ROUGHNESS, PLOT_ALL flags.
         """
 
         kwargs.setdefault('PLOT_LEVEL', False)
@@ -119,9 +195,43 @@ class SurfaceTexture():
         self.x_units = x_units
         self.y_units = y_units
         self.raw_data = raw_data
-        self.short_cutoff = short_cutoff
-        self.long_cutoff = long_cutoff
         self.order = order
+
+        # ----- ISO 21920-3 setting-class resolution -----------------------
+        # If the user did not name a class but supplied explicit cutoffs we
+        # treat the configuration as "Custom"; otherwise we fall back to Sc3.
+        if setting_class is None and short_cutoff is None and long_cutoff is None:
+            setting_class = DEFAULT_SETTING_CLASS
+
+        sc = get_setting_class(setting_class) if setting_class else None
+        self.setting_class = sc            # SettingClass instance or None
+        self.setting_class_name = sc.name if sc else "Custom"
+
+        # All canonical class lengths are mm; convert into the data's X unit.
+        if sc is not None:
+            sc_lambda_s = convert_mm_to(sc.lambda_s_mm, x_units)
+            sc_lambda_c = convert_mm_to(sc.lambda_c_mm, x_units)
+            sc_target_nsc = sc.nsc
+        else:
+            sc_lambda_s = sc_lambda_c = None
+            sc_target_nsc = 5
+
+        self.short_cutoff = short_cutoff if short_cutoff is not None else sc_lambda_s
+        self.long_cutoff = long_cutoff if long_cutoff is not None else sc_lambda_c
+
+        if self.short_cutoff is None or self.long_cutoff is None:
+            raise ValueError(
+                "Filter cutoffs must be provided either explicitly "
+                "(short_cutoff, long_cutoff) or via setting_class."
+            )
+
+        # ``target_nsc`` is the ISO-preferred number of sections (5). The
+        # *actual* ``nsc`` may be reduced after the trace is loaded if the
+        # measurement is too short to fit 5 full λc sampling lengths plus
+        # the filter end-buffers (see the filter pipeline below).
+        self.target_nsc = sc_target_nsc
+        self.nsc = sc_target_nsc
+
         self.primary = self._load_profile_data(
             self.raw_data,
             x_col=x_col,
@@ -133,6 +243,11 @@ class SurfaceTexture():
         self.raw_data_xy = self.primary.copy()
         self.level_fit_x = None
         self.level_fit_y = None
+        self.section_edges = None          # x positions of nsc+1 dividers
+        self.section_Rz_values = []        # per-section peak-to-valley
+        self.le_window = None              # (x_start, x_end) used for params
+        self.dx_warning = None             # populated if dx exceeds Sc dx_max
+        self.nsc_warning = None            # populated if nsc reduced below target
 
         # if profile leveling is called for then fit to line/curve
         if order: 
@@ -183,59 +298,127 @@ class SurfaceTexture():
         if not np.isfinite(T) or T <= 0:
             raise ValueError(f"Invalid x spacing: computed sample spacing T={T}.")
         self.Fs = 1.0 / T
+        self.dx = T
+
+        # ISO 21920-3 dx_max coupling — warn (do not block) if class is set
+        if self.setting_class is not None:
+            dx_max_in_x_units = convert_mm_to(self.setting_class.dx_max_mm, self.x_units)
+            # Allow a small floating-point tolerance so traces exactly at the
+            # spec value don't trigger a spurious warning.
+            if T > dx_max_in_x_units * 1.001:
+                self.dx_warning = (
+                    f"Sample spacing dx = {T:.4g} {self.x_units} exceeds "
+                    f"{self.setting_class.name} maximum "
+                    f"{dx_max_in_x_units:.4g} {self.x_units} per ISO 21920-3 Table 1."
+                )
 
         def gauss_filter(data, cutoff):
+            # cutoff is a spatial frequency (1/length). The effective Gaussian
+            # standard deviation in samples is Fs / (2*pi*cutoff).
             sigma = abs(self.Fs / (2 * np.pi * cutoff))
             sigma = max(sigma, np.finfo(float).eps)
 
-            window_len = int(round(abs(self.Fs * cutoff)))
-            window_len = max(window_len, 3)
-            if window_len % 2 == 0:
-                window_len += 1
+            # Truncate the window where the Gaussian underflows in float64
+            # (~38 sigma).
+            half = max(int(np.ceil(38.0 * sigma)), 1)
+            window_len = 2 * half + 1
 
-            window = signal.windows.gaussian(window_len, sigma) /\
+            window = signal.windows.gaussian(window_len, sigma) / \
                     (sigma * np.sqrt(2 * np.pi))
-            # plt.plot(window)
-            window = np.asarray([x for x in window if x > 0], dtype=float)
-            # plt.plot(window, 'r', linestyle='--')
-            # plt.show()
+            window = window[window > 0]
             return signal.fftconvolve(data, window, mode="same")
 
-        # buffer used for clipping valid data
+        self._gauss_filter = gauss_filter  # exposed for plotting helpers
+
+        # Filter end-effect buffer (one half-cutoff per filter).
         prim_buff = int(self.short_cutoff / (2 * T))
         wav_buff = int(self.long_cutoff / (2 * T))
-
-        # Validate cutoffs vs available data length
+        edge_buff = prim_buff + wav_buff
         n_pts = self.primary[0].size
-        total_buff = 2 * (prim_buff + wav_buff)
-        if prim_buff < 1 or wav_buff < 1 or total_buff >= n_pts - 4:
+
+        # ----- Auto-derive evaluation length and nsc ----------------------
+        # The sampling-section length lsc is, by ISO 21920-3 default, equal
+        # to λc. We try to fit ``target_nsc`` (= 5 by default) full sections
+        # inside the trace after subtracting the filter end-buffers; if the
+        # trace is too short we reduce nsc down toward 1, recording a
+        # warning. If even a single lsc + buffers won't fit we raise.
+        lsc_samples = max(int(round(self.long_cutoff / T)), 1)
+        usable = n_pts - 2 * edge_buff
+        max_nsc_that_fits = max(usable // lsc_samples, 0)
+        nsc_actual = min(self.target_nsc, max_nsc_that_fits)
+
+        if nsc_actual < 1:
+            # Suggest the next-smaller setting class if there is one.
+            suggestion = ""
+            if self.setting_class is not None:
+                try:
+                    cur_idx = int(self.setting_class.name[2:])
+                    if cur_idx > 1:
+                        suggestion = f" Tip: try setting class Sc{cur_idx - 1}."
+                except (ValueError, IndexError):
+                    pass
             raise ValueError(
-                "Filter cutoffs are incompatible with the data length / spacing.\n"
-                f"  Sample spacing T = {T:.6g} {self.x_units}\n"
-                f"  Short cutoff = {self.short_cutoff} {self.x_units} -> buffer {prim_buff} samples\n"
-                f"  Long cutoff  = {self.long_cutoff} {self.x_units} -> buffer {wav_buff} samples\n"
-                f"  Trace length = {n_pts} samples; need < {n_pts - 4} buffer but require {total_buff}.\n"
-                "  Tip: cutoffs must be in the same distance units as the X data "
-                f"({self.x_units}). For inch data try short=9.8425e-5, long=0.031496."
+                "Trace is too short for the requested ISO 21920-3 setting.\n"
+                f"  Sample spacing dx = {T:.6g} {self.x_units}\n"
+                f"  Cutoffs λs = {self.short_cutoff:g} {self.x_units}, "
+                f"λc = {self.long_cutoff:g} {self.x_units}\n"
+                f"  Filter buffer = {edge_buff} samples each end\n"
+                f"  One sampling length lsc = λc requires {lsc_samples} samples, "
+                f"but only {max(usable, 0)} samples are usable after the "
+                f"filter end-buffers (trace has {n_pts} samples).{suggestion}"
             )
 
-        # filter primary using short wave cutoff and clip valid data
-        freq = 1 / self.short_cutoff
-        denoised_primary = gauss_filter(self.primary[1], freq)
-        denoised_primary = denoised_primary[prim_buff:-prim_buff+1]
+        self.nsc = nsc_actual
+        le_samples = lsc_samples * nsc_actual
+        self.evaluation_length = le_samples * T
+        self.lsc = float(self.long_cutoff)
 
-        # filter out wavinesss using long wave cutoff and clip valid data
-        freq = 1 / self.long_cutoff                                        
-        waviness = gauss_filter(denoised_primary, freq)
-        denoised_primary = denoised_primary[wav_buff:-wav_buff+1]
-        waviness = waviness[wav_buff:-wav_buff+1]
+        if nsc_actual < self.target_nsc:
+            # Soft warning — surface via plot banner, GUI log, and stderr.
+            self.nsc_warning = (
+                f"Trace is too short for the ISO 21920-3 default of "
+                f"nsc = {self.target_nsc} sampling lengths at "
+                f"{self.setting_class_name}; using nsc = {nsc_actual} "
+                f"(le = {self.evaluation_length:g} {self.x_units} "
+                f"instead of {self.target_nsc * self.long_cutoff:g} {self.x_units}). "
+                f"Reported parameters are computed but should be flagged as "
+                f"non-conformant with the default sampling-section count."
+            )
+            import sys as _sys
+            print(f"WARNING: {self.nsc_warning}", file=_sys.stderr)
 
-        # store data in class variables
-        wav_x = self.primary[0][prim_buff:-prim_buff+1][wav_buff:-wav_buff+1]
-        self.roughness = np.vstack((wav_x, denoised_primary - waviness))
+        # ----- ISO 21920-21 S- and L- filtering ---------------------------
+        # Apply S-filter (λs) and L-filter (λc) to the *full* primary trace
+        # so each filtered series has the same length as primary[0]. The
+        # central evaluation-length window is then sliced consistently.
+        denoised_primary_full = gauss_filter(self.primary[1], 1.0 / self.short_cutoff)
+        waviness_full = gauss_filter(denoised_primary_full, 1.0 / self.long_cutoff)
+        roughness_full = denoised_primary_full - waviness_full
+
+        # Centre the evaluation-length window inside the usable region.
+        start = edge_buff + (usable - le_samples) // 2
+        end = start + le_samples
+
+        wav_x = self.primary[0][start:end]
+        denoised_primary = denoised_primary_full[start:end]
+        waviness = waviness_full[start:end]
+        roughness = roughness_full[start:end]
+
+        self.roughness = np.vstack((wav_x, roughness))
         self.waviness = np.vstack((wav_x, waviness))
+        self.denoised_primary = np.vstack((wav_x, denoised_primary))
+        self.le_window = (float(wav_x[0]), float(wav_x[-1]))
+        # Buffer regions on the *full* primary, for shading on plots.
+        self.le_buffer_regions = [
+            (float(self.primary[0][0]), float(self.primary[0][start])),
+            (float(self.primary[0][end - 1]), float(self.primary[0][-1])),
+        ]
+        # Section dividers (nsc + 1 boundaries spanning the le window).
+        self.section_edges = np.array([
+            float(wav_x[i * lsc_samples]) for i in range(self.nsc)
+        ] + [float(wav_x[-1])])
 
-        # generate roughness parameters
+        # Generate roughness parameters --------------------------------------
         len_wav_x = len(wav_x)
         if len_wav_x == 0:
             raise ValueError(
@@ -244,31 +427,239 @@ class SurfaceTexture():
                 f"same units as the X data ({self.x_units})."
             )
         self.R_params = {}
-        self.R_params['Ra'] = (sum(map(abs, self.roughness[1]))
-                            / len_wav_x, self.y_units)
-        self.R_params['Rq'] = (np.sqrt(sum(map(np.square, self.roughness[1]))
-                            / len_wav_x), self.y_units)
-        self.R_params['Rsk'] = (sum([x ** 3 for x in self.roughness[1]]) /
-                             ((self.R_params['Rq'][0] ** 3) * len_wav_x), "")
-        self.R_params['Rku'] = (sum([x ** 4 for x in self.roughness[1]]) /
-                             ((self.R_params['Rq'][0] ** 4) * len_wav_x), "")
-        # ISO 4287 amplitude parameters (Rp/Rv on filtered roughness profile)
-        Rp = float(np.max(self.roughness[1]))
-        Rv = float(abs(np.min(self.roughness[1])))
-        Rz = Rp + Rv
-        self.R_params['Rp'] = (Rp, self.y_units)
-        self.R_params['Rv'] = (Rv, self.y_units)
-        self.R_params['Rz'] = (Rz, self.y_units)
-        self.R_params['Rt'] = (Rz, self.y_units)
-        
+        # Field parameters (ISO 21920-2 §4) — averaged over le
+        self.R_params['Ra'] = (float(np.mean(np.abs(roughness))), self.y_units)
+        Rq = float(np.sqrt(np.mean(roughness ** 2)))
+        self.R_params['Rq'] = (Rq, self.y_units)
+        if Rq > 0:
+            self.R_params['Rsk'] = (float(np.mean(roughness ** 3)) / (Rq ** 3), "")
+            self.R_params['Rku'] = (float(np.mean(roughness ** 4)) / (Rq ** 4), "")
+        else:
+            self.R_params['Rsk'] = (0.0, "")
+            self.R_params['Rku'] = (0.0, "")
+
+        # Per-section peak/valley parameters (ISO 21920-3 §5.3 / Table 4)
+        section_Rp = []
+        section_Rv = []
+        section_Rz = []
+        for i in range(self.nsc):
+            seg = roughness[i * lsc_samples:(i + 1) * lsc_samples]
+            sp = float(np.max(seg))
+            sv = float(abs(np.min(seg)))
+            section_Rp.append(sp)
+            section_Rv.append(sv)
+            section_Rz.append(sp + sv)
+        self.section_Rp_values = section_Rp
+        self.section_Rv_values = section_Rv
+        self.section_Rz_values = section_Rz
+
+        # ISO 21920-3:2021 amplitude parameters
+        # Rp = mean of section maxima ; Rv = mean of section |minima|
+        # Rz = mean section peak-to-valley ; Rzx = max section peak-to-valley
+        # Rt = max-min over the full evaluation length
+        Rp_iso = float(np.mean(section_Rp))
+        Rv_iso = float(np.mean(section_Rv))
+        Rz_iso = float(np.mean(section_Rz))
+        Rzx_iso = float(np.max(section_Rz))
+        Rt_iso = float(np.max(roughness) - np.min(roughness))
+
+        self.R_params['Rp'] = (Rp_iso, self.y_units)
+        self.R_params['Rv'] = (Rv_iso, self.y_units)
+        self.R_params['Rz'] = (Rz_iso, self.y_units)
+        self.R_params['Rzx'] = (Rzx_iso, self.y_units)
+        self.R_params['Rt'] = (Rt_iso, self.y_units)
+
+        # ----- ISO 16610-31 robust Gaussian regression (2nd order) --------
+        # Used as the L-operator for the Rk-family per ISO 21920-3 Table 1.
+        try:
+            self.robust_mean = self._robust_gauss_regression_2nd_order(
+                denoised_primary, self.long_cutoff, T,
+            )
+            self.roughness_robust = denoised_primary - self.robust_mean
+        except Exception:
+            # If robust filter fails, fall back silently to linear-filtered roughness
+            self.robust_mean = waviness.copy()
+            self.roughness_robust = roughness.copy()
+
         if kwargs['PLOT_ROUGHNESS'] or kwargs['PLOT_ALL']:
             self.plot_roughness()
 
         if kwargs['PLOT_MR'] or kwargs['PLOT_ALL']:
             self.plot_material_ratio()
 
+    # ------------------------------------------------------------------
+    # ISO 16610-31 robust Gaussian regression filter, second order.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _robust_gauss_regression_2nd_order(y, lc, dx, max_iter=8, tol=5e-4):
+        """ISO 16610-31:2010 robust Gaussian regression filter (2nd order).
+
+        Iteratively reweighted local quadratic regression with Gaussian
+        spatial weights of standard deviation σ = λc / (2π). The iterative
+        weight uses Tukey's biweight on residuals scaled by 1.4826·MAD,
+        with the ISO 16610-31 cut-off constant cb = 4.4478.
+
+        Parameters
+        ----------
+        y : ndarray
+            1-D profile (already S-filtered if applicable).
+        lc : float
+            Long-wavelength cutoff in distance units (same as ``dx``).
+        dx : float
+            Sample spacing in the same distance unit as ``lc``.
+
+        Returns
+        -------
+        ndarray, shape ``y.shape``
+            Robust mean line.
+        """
+        y = np.asarray(y, dtype=float)
+        n = y.size
+        if n < 5:
+            return y.copy()
+
+        sigma = lc / (2.0 * np.pi)
+        sigma_samp = sigma / dx
+        # 5σ truncation is sufficient when delta-weights down-rank the tail.
+        half = max(int(np.ceil(5.0 * sigma_samp)), 2)
+        k = np.arange(-half, half + 1, dtype=float)
+        u = k * dx
+        # Unnormalised Gaussian — proportional constants cancel in the
+        # weighted-least-squares normal equations.
+        g = np.exp(-0.5 * (u / sigma) ** 2)
+        K0 = g
+        K1 = g * u
+        K2 = g * (u ** 2)
+        K3 = g * (u ** 3)
+        K4 = g * (u ** 4)
+
+        # Initial estimate: ordinary Gaussian convolution.
+        norm = g.sum()
+        mean_line = signal.fftconvolve(y, g / norm, mode="same")
+
+        cb = 4.4478  # ISO 16610-31 robust scale constant
+        for _ in range(max_iter):
+            residuals = y - mean_line
+            med = float(np.median(residuals))
+            mad = float(np.median(np.abs(residuals - med)))
+            scale = max(1.4826 * mad, 1e-12)
+            ur = residuals / (cb * scale)
+            delta = np.where(np.abs(ur) < 1.0, (1.0 - ur ** 2) ** 2, 0.0)
+
+            # Weighted moments via FFT convolutions (zero-padded edges).
+            M0 = signal.fftconvolve(delta, K0, mode="same")
+            M1 = signal.fftconvolve(delta, K1, mode="same")
+            M2 = signal.fftconvolve(delta, K2, mode="same")
+            M3 = signal.fftconvolve(delta, K3, mode="same")
+            M4 = signal.fftconvolve(delta, K4, mode="same")
+            dy = delta * y
+            T0 = signal.fftconvolve(dy, K0, mode="same")
+            T1 = signal.fftconvolve(dy, K1, mode="same")
+            T2 = signal.fftconvolve(dy, K2, mode="same")
+
+            # Solve the 3x3 normal equations at every point via Cramer's rule.
+            # | M0 M1 M2 | |a|   |T0|
+            # | M1 M2 M3 | |b| = |T1|
+            # | M2 M3 M4 | |c|   |T2|
+            det_A = (M0 * (M2 * M4 - M3 * M3)
+                     - M1 * (M1 * M4 - M3 * M2)
+                     + M2 * (M1 * M3 - M2 * M2))
+            det_a = (T0 * (M2 * M4 - M3 * M3)
+                     - M1 * (T1 * M4 - M3 * T2)
+                     + M2 * (T1 * M3 - M2 * T2))
+            safe_det = np.where(np.abs(det_A) < 1e-300, 1.0, det_A)
+            new_mean = np.where(np.abs(det_A) < 1e-300, mean_line, det_a / safe_det)
+
+            denom = max(float(np.max(np.abs(y))), 1e-12)
+            change = float(np.max(np.abs(new_mean - mean_line))) / denom
+            mean_line = new_mean
+            if change < tol:
+                break
+        return mean_line
+
     def wear_track_depth(self):
         return min(self.primary[1]), "μm"
+
+    # ------------------------------------------------------------------
+    # Plot annotation helpers (ISO 21920-3 conformance)
+    # ------------------------------------------------------------------
+    def _iso_banner_text(self) -> str:
+        """Return a 1- or 2-line ISO conformance banner.
+
+        The banner identifies the standards used and the active setting class
+        so any rendered figure is self-describing.
+        """
+        line1 = "ISO 21920-3:2021 / ISO 21920-2:2021"
+        sc_name = getattr(self, 'setting_class_name', 'Custom')
+        sc_obj = getattr(self, 'setting_class', None)
+        if sc_obj is not None:
+            line2 = (
+                f"Setting class: {sc_name}   "
+                f"λc = {self.long_cutoff:g} {self.x_units}   "
+                f"λs = {self.short_cutoff:g} {self.x_units}   "
+                f"le = {self.evaluation_length:g} {self.x_units}   "
+                f"nsc = {self.nsc}   "
+                f"dx = {getattr(self, 'dx', float('nan')):.3g} {self.x_units}"
+            )
+        else:
+            line2 = (
+                f"Setting class: Custom   "
+                f"λc = {self.long_cutoff:g} {self.x_units}   "
+                f"λs = {self.short_cutoff:g} {self.x_units}   "
+                f"le = {self.evaluation_length:g} {self.x_units}   "
+                f"nsc = {self.nsc}"
+            )
+        warnings = []
+        if getattr(self, 'nsc_warning', None):
+            warnings.append(
+                f"⚠ nsc reduced to {self.nsc} (ISO default {self.target_nsc}) "
+                f"— trace too short for full le"
+            )
+        if getattr(self, 'dx_warning', None):
+            warnings.append(f"⚠ {self.dx_warning}")
+        if warnings:
+            return "\n".join([line1, line2] + warnings)
+        return f"{line1}\n{line2}"
+
+    def _draw_section_overlays(self, ax, *, show_section_rz=True) -> None:
+        """Overlay ISO 21920-3 sampling-section dividers on an axis.
+
+        Draws ``nsc + 1`` thin dotted vertical lines at the section edges
+        and (optionally) annotates each section with its peak-to-valley
+        ``Rzi`` value.
+        """
+        if self.section_edges is None or len(self.section_edges) < 2:
+            return
+        for x_edge in self.section_edges:
+            ax.axvline(x_edge, color='dimgrey', ls=':', lw=0.7, alpha=0.8,
+                       zorder=2)
+        # le label sits just inside the axes at the top centre.
+        x0, xN = float(self.section_edges[0]), float(self.section_edges[-1])
+        ax.text(
+            0.5 * (x0 + xN), 0.98,
+            f'le = {self.evaluation_length:g} {self.x_units}',
+            transform=ax.get_xaxis_transform(),
+            ha='center', va='top', fontsize=7, color='dimgrey', alpha=0.9,
+        )
+        if show_section_rz and self.section_Rz_values:
+            for i, Rz_i in enumerate(self.section_Rz_values):
+                xc = 0.5 * (float(self.section_edges[i])
+                            + float(self.section_edges[i + 1]))
+                ax.text(
+                    xc, 0.92, f"Rz{i+1}={Rz_i:.2f}",
+                    transform=ax.get_xaxis_transform(),
+                    ha='center', va='top', fontsize=6, color='dimgrey',
+                    alpha=0.85,
+                )
+
+    def _shade_le_buffer(self, ax) -> None:
+        """Shade the trimmed end-buffer regions on the primary axis."""
+        if not getattr(self, 'le_buffer_regions', None):
+            return
+        for x_lo, x_hi in self.le_buffer_regions:
+            if x_hi > x_lo:
+                ax.axvspan(x_lo, x_hi, color='lightgrey', alpha=0.25,
+                           zorder=0, label='_nolegend_')
 
     def plot_roughness(self, y_lim=None):
         fig, axs = plt.subplots(2, 1, figsize=(9, 4))
@@ -276,15 +667,21 @@ class SurfaceTexture():
         # plot primary and waviness together
         axs[0].plot(*self.primary, linewidth=0.5, color="blue")
         axs[0].plot(*self.waviness, linewidth=0.5, color="red")
-        PW_title = f"Primary + Waviness, λc/s = {self.long_cutoff}mm " +\
-                   f"{self.short_cutoff*1000}μm"
+        PW_title = (f"Primary + Waviness, λc = {self.long_cutoff} {self.x_units}, "
+                    f"λs = {self.short_cutoff} {self.x_units}")
         axs[0].set_title(PW_title)
-        
+
         # plot roughness
         axs[1].plot(*self.roughness, linewidth=0.5, color="green")
-        R_title = f"Roughness, λc/s = {self.long_cutoff}mm " +\
-                f"{self.short_cutoff*1000}μm"
+        R_title = (f"Roughness  (λc = {self.long_cutoff} {self.x_units}, "
+                   f"λs = {self.short_cutoff} {self.x_units}, "
+                   f"le = {self.evaluation_length:g} {self.x_units}, "
+                   f"nsc = {self.nsc})")
         axs[1].set_title(R_title)
+
+        # ISO 21920-3 sectioning + le window overlays
+        self._draw_section_overlays(axs[1])
+        self._shade_le_buffer(axs[0])
 
         minor_locator = AutoMinorLocator(2)
         # set x and y limits
@@ -306,9 +703,10 @@ class SurfaceTexture():
             a.xaxis.set_minor_locator(minor_locator)
 
         # add R-Parameters to plot
-        p = 'ISO 21290-2:2021\n'
+        p = self._iso_banner_text() + '\n\n'
         for key in self.R_params:
-            p += f"{key} = {self.R_params[key][0]:.3f}{self.R_params[key][1]}\n"
+            value, unit = self.R_params[key]
+            p += f"{key} = {self.format_param_value(key, value, unit)}{unit}\n"
         fig.text(0.02, 0.05, p, 
                     transform=axs[1].transAxes, fontsize=8,
                     verticalalignment='bottom',
@@ -322,11 +720,20 @@ class SurfaceTexture():
     def get_material_ratio(self, samples=1000, Pk_Offset=0.01, Vy_Offset=0.01):
         self.mr_params = {}
         self.Pk_Offset, self.Vy_Offset = Pk_Offset, Vy_Offset
-        
+
+        # ISO 21920-3 Table 1: Rk-family parameters use the ISO 16610-31
+        # robust 2nd-order Gaussian regression filter as their L-operator.
+        # Fall back to the linear-filtered roughness if the robust output
+        # is unavailable for any reason.
+        if hasattr(self, 'roughness_robust') and self.roughness_robust is not None:
+            mr_source = np.vstack((self.roughness[0], self.roughness_robust))
+        else:
+            mr_source = self.roughness
+
         # sort the uniformly sampled profile in descending order
-        self.material_ratio = np.sort(self.roughness[1])[::-1]
-        self.material_ratio_all = self.roughness[:, self.roughness[1].argsort()[::-1]]
-        size = self.roughness[0].size
+        self.material_ratio = np.sort(mr_source[1])[::-1]
+        self.material_ratio_all = mr_source[:, mr_source[1].argsort()[::-1]]
+        size = mr_source[0].size
         x = np.linspace(0, 100, size)
         self.material_ratio_all = np.vstack((self.material_ratio_all, x))
 
@@ -496,7 +903,7 @@ class SurfaceTexture():
         # create Rmr parameters table
         rows = ['Rk', 'Rpk', 'Rvk', 'Rmrk1', 'Rmrk2', 'Rak1', 'Rak2', 'Rpkx', 'Rvkx']
         units = ['μm', 'μm', 'μm', 'μm', 'μm', '%', '%', 'μm.%', 'μm.%']
-        columns = ['ISO 21290-2:2021 Parameter', 'Value', 'Unit']
+        columns = ['ISO 21920-2:2021 Parameter', 'Value', 'Unit']
         n_rows = len(rows)
         
         cell_text = []
@@ -525,6 +932,9 @@ class SurfaceTexture():
         if n == 0:
             self.R_params['Rmr'] = (0.0, unit_label)
             self.Rmr_target_level = 0.0
+            self.Rmr_Cref = float(Cref)
+            self.Rmr_Cref_level = 0.0
+            self.Rmr_Rz4_drop = 0.0
             return
         Rz = self.R_params['Rz'][0]
         sorted_desc = np.sort(rough)[::-1]
@@ -535,9 +945,11 @@ class SurfaceTexture():
         Rmr = above / n * 100.0
         self.R_params['Rmr'] = (Rmr, unit_label)
         self.Rmr_target_level = target
+        self.Rmr_Cref = float(Cref)
         self.Rmr_Cref_level = c0
+        self.Rmr_Rz4_drop = Rz / 4.0
 
-    def build_overview_figure(self, Cref=5.0):
+    def build_overview_figure(self, Cref=5.0, y_lim=None):
         """Build a matplotlib ``Figure`` (no pyplot) suitable for GUI embedding.
 
         The figure contains four panels:
@@ -552,10 +964,13 @@ class SurfaceTexture():
             self.get_material_ratio()
         self.compute_Rmr(Cref=Cref)
 
-        fig = Figure(figsize=(11, 7.5))
+        # Wider default figure to avoid cramped right-hand panels/table clipping.
+        fig = Figure(figsize=(15.0, 7.5))
         gs = fig.add_gridspec(2, 2,
-                              width_ratios=[2, 1],
-                              hspace=0.40, wspace=0.30)
+                  width_ratios=[2.25, 1.45],
+                      hspace=0.40, wspace=0.30)
+        # Reserve extra room for the multi-line ISO banner/suptitle.
+        fig.subplots_adjust(top=0.82, bottom=0.08, left=0.06, right=0.98)
         ax_raw = fig.add_subplot(gs[0, 0])
         ax_bear = fig.add_subplot(gs[0, 1])
         ax_rough = fig.add_subplot(gs[1, 0])
@@ -569,69 +984,119 @@ class SurfaceTexture():
                         color='red', lw=1.0,
                         label=f'order {self.order} fit')
             ax_raw.legend(fontsize=8, loc='best')
-        ax_raw.set_title('Raw Data + Leveling Fit')
+        ax_raw.set_title('Raw Data + Leveling Fit', pad=6)
         ax_raw.set_xlabel(f'size, {self.x_units}')
         ax_raw.set_ylabel(f'height, {self.y_units}')
+        if y_lim is not None:
+            ax_raw.set_ylim(y_lim)
         ax_raw.grid(True, ls=':', alpha=0.5)
+        # Shade the trimmed end-buffer regions to communicate the le window.
+        self._shade_le_buffer(ax_raw)
 
         # --- Roughness + waviness ---------------------------------------
         ax_rough.plot(*self.roughness, lw=0.5, color='green', label='roughness')
         ax_rough.plot(*self.waviness, lw=0.9, color='red', label='waviness')
+        # Overlay ISO 16610-31 robust mean line used for the Rk-family.
+        if hasattr(self, 'robust_mean') and self.robust_mean is not None:
+            ax_rough.plot(
+                self.roughness[0], self.robust_mean,
+                color='darkorange', lw=0.9, ls='--',
+                label='ISO 16610-31 robust mean (Rk-family L-filter)',
+            )
         ax_rough.set_title(
-            f'Roughness + Waviness  (\u03bbc={self.long_cutoff}{self.x_units}, '
-            f'\u03bbs={self.short_cutoff}{self.x_units})'
+            f'Roughness + Waviness  (\u03bbc = {self.long_cutoff:g} {self.x_units}, '
+            f'\u03bbs = {self.short_cutoff:g} {self.x_units}, '
+            f'le = {self.evaluation_length:g} {self.x_units}, nsc = {self.nsc})'
         )
         ax_rough.set_xlabel(f'size, {self.x_units}')
         ax_rough.set_ylabel(f'height, {self.y_units}')
+        if y_lim is not None:
+            ax_rough.set_ylim(y_lim)
         ax_rough.axhline(0, color='black', lw=0.5)
-        ax_rough.legend(fontsize=8, loc='best')
+        ax_rough.legend(fontsize=7, loc='best')
         ax_rough.grid(True, ls=':', alpha=0.5)
+        # Section dividers + per-section Rz markers.
+        self._draw_section_overlays(ax_rough, show_section_rz=True)
 
         # --- Bearing ratio curve ----------------------------------------
         # self.material_ratio[0] is %; self.material_ratio[1] is depth
         ax_bear.plot(self.material_ratio[0], self.material_ratio[1],
                      color='blue', lw=1.0)
-        ax_bear.set_title('Bearing Ratio Curve')
+        ax_bear.set_title('Bearing Ratio Curve', pad=6)
         ax_bear.set_xlabel('Material Ratio %')
         ax_bear.set_ylabel(f'depth, {self.y_units}')
         ax_bear.set_xlim(0, 100)
+        if y_lim is not None:
+            ax_bear.set_ylim(y_lim)
         ax_bear.grid(True, ls=':', alpha=0.5)
         if hasattr(self, 'Rmr_target_level'):
+            cref = getattr(self, 'Rmr_Cref', Cref)
+            cref_level = getattr(self, 'Rmr_Cref_level', self.Rmr_target_level)
+            rz4_drop = getattr(self, 'Rmr_Rz4_drop', 0.0)
+            Rmr_val = self.R_params['Rmr'][0]
+
+            # Construction lines for Rmr: start at Cref, drop by Rz/4,
+            # then read the resulting material ratio.
+            ax_bear.axvline(cref, color='darkorange', ls='--', lw=0.9,
+                            label=f'Cref = {cref:g}%')
+            ax_bear.plot(cref, cref_level, marker='o', ms=4,
+                         color='darkorange', zorder=4)
+            ax_bear.plot([cref, cref], [cref_level, self.Rmr_target_level],
+                         color='darkorange', ls='-.', lw=1.0,
+                         label=f'Rz/4 drop = {self.format_param_value("Rz", rz4_drop, self.y_units)} {self.y_units}')
+
+            # Visual step guides: depth at Cref, then horizontal read to Rmr.
+            ax_bear.axhline(cref_level, color='red', ls=':', lw=0.9,
+                            label=f'Depth at Cref ({cref:g}%)')
+            ax_bear.plot([cref, Rmr_val], [self.Rmr_target_level, self.Rmr_target_level],
+                         color='red', ls=':', lw=1.0,
+                         label='Read across to Rmr')
+
             ax_bear.axhline(self.Rmr_target_level, color='gray',
                             ls='--', lw=0.7,
-                            label=f'Rz/4 slice')
-            Rmr_val = self.R_params['Rmr'][0]
+                            label='Target level (Cref - Rz/4)')
             ax_bear.axvline(Rmr_val, color='magenta', ls=':', lw=0.8,
-                            label=f'Rmr = {Rmr_val:.2f}%')
+                            label=f"Rmr = {self.format_param_value('Rmr', Rmr_val, '%')}%")
             ax_bear.legend(fontsize=7, loc='best')
 
         # --- R-parameter table -------------------------------------------
         ax_table.set_axis_off()
-        rows = ['Ra', 'Rp', 'Rt', 'Rv', 'Rz', 'Rq', 'Rsk', 'Rmr']
+        rows = ['Ra', 'Rq', 'Rp', 'Rv', 'Rz', 'Rzx', 'Rt', 'Rsk', 'Rku', 'Rmr']
         cells = []
         for r in rows:
             v, u = self.R_params.get(r, ('-', ''))
             if isinstance(v, (int, float)):
-                cells.append([f'{v:.4f}', u])
+                cells.append([self.format_param_value(r, v, u), u])
             else:
                 cells.append([str(v), u])
         tbl = ax_table.table(cellText=cells,
-                             rowLabels=rows,
-                             colLabels=['Value', 'Unit'],
-                             loc='center', cellLoc='center')
+                     rowLabels=rows,
+                     colLabels=['Value', 'Unit'],
+                     loc='center', cellLoc='center',
+                     colWidths=[0.43, 0.57])
         tbl.auto_set_font_size(False)
-        tbl.set_fontsize(9)
-        tbl.scale(1, 1.4)
-        ax_table.set_title(f'R-Parameters  (Cref = {Cref:g}%)', fontsize=10)
+        tbl.set_fontsize(10)
+        tbl.scale(1.08, 1.42)
+        ax_table.set_title('R-Parameters', fontsize=10, pad=12)
 
-        fig.suptitle(os.path.basename(self.raw_data), fontsize=11)
+        # --- ISO conformance banner --------------------------------------
+        banner = self._iso_banner_text()
+        title = f"{os.path.basename(self.raw_data)}\n{banner}"
+        fig.suptitle(title, fontsize=10, x=0.5, y=0.98, ha='center')
         return fig
 
     def __str__(self):
-        p = f'\nProcessed {self.raw_data} with λc = {self.long_cutoff}mm\n' \
-            f'and λc/s = {self.short_cutoff*1000}μm\n\nParam\tValue'
+        p = (
+            f'\nProcessed {self.raw_data}\n'
+            f'  Setting class: {self.setting_class_name}\n'
+            f'  \u03bbc = {self.long_cutoff:g} {self.x_units}, '
+            f'\u03bbs = {self.short_cutoff:g} {self.x_units}, '
+            f'le = {self.evaluation_length:g} {self.x_units}, nsc = {self.nsc}\n'
+            f'\nParam\tValue'
+        )
         for key in self.R_params:
-            p += f"\n{key}:\t{self.R_params[key][0]:.3f}{self.R_params[key][1]}"
+            value, unit = self.R_params[key]
+            p += f"\n{key}:\t{self.format_param_value(key, value, unit)}{unit}"
         p += "\n"
         return p
 

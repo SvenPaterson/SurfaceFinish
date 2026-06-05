@@ -5,6 +5,7 @@ import sys
 import matplotlib.pyplot as plt
 
 from SurfaceTexture import SurfaceTexture
+from iso21920 import SETTING_CLASSES, DEFAULT_SETTING_CLASS
 
 
 def _pick_root_xlsx(root_dir: Path) -> Path:
@@ -39,10 +40,17 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--y-col", default=1, help="Y column index or name (default: 1)")
     parser.add_argument("--x-unit", default="mm", help="Label for X axis unit (default: mm)")
     parser.add_argument("--y-unit", default="μm", help="Label for Y axis unit (default: μm)")
-    parser.add_argument("--short-cutoff", type=float, default=2.5 / 1000,
-                        help="Short wave cutoff in mm (default: 0.0025)")
-    parser.add_argument("--long-cutoff", type=float, default=0.8,
-                        help="Long wave cutoff in mm (default: 0.8)")
+    parser.add_argument(
+        "--setting-class",
+        choices=sorted(SETTING_CLASSES.keys()) + ["Custom"],
+        default=DEFAULT_SETTING_CLASS,
+        help=(f"ISO 21920-3 setting class (default: {DEFAULT_SETTING_CLASS}). "
+              "Use 'Custom' to drive cutoffs purely from --short-cutoff/--long-cutoff."),
+    )
+    parser.add_argument("--short-cutoff", type=float, default=None,
+                        help="Short wave cutoff λs (data X units). Overrides setting class.")
+    parser.add_argument("--long-cutoff", type=float, default=None,
+                        help="Long wave cutoff λc (data X units). Overrides setting class.")
     parser.add_argument("--order", type=int, default=1,
                         help="Leveling polynomial order: 0, 1, 2, or 3")
     parser.add_argument("--plot-level", action="store_true",
@@ -93,6 +101,7 @@ if __name__ == "__main__":
         x_col=args.x_col,
         y_col=args.y_col,
         sheet_name=_parse_sheet(args.sheet),
+        setting_class=None if args.setting_class == "Custom" else args.setting_class,
         PLOT_LEVEL=args.plot_level,
     )
 

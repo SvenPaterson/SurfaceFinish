@@ -3,4 +3,5 @@ scipy
 matplotlib
 pandas
 openpyxl
+python-calamine
 blume
