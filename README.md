@@ -1,45 +1,84 @@
 # SurfaceFinish
-Exploring the world of surface finish data analysis.
 
-## Run
+Surface roughness analysis toolkit with both CLI and Tkinter GUI front ends.
+
+The current implementation targets:
+
+- ISO 21920-3:2021 (profile acquisition / setting-class defaults)
+- ISO 21920-2:2021 (parameter definitions)
+- ISO 16610-21 (Gaussian S/L filtering)
+- ISO 16610-31 (robust Gaussian regression L-filter for Rk-family source profile)
+
+## Features
+
+- TXT, CSV, and Excel input
+- ISO setting classes Sc1-Sc5 via `iso21920.py`
+- Automatic derivation of sampling section behavior:
+	- `lsc = λc`
+	- target `nsc = 5`
+	- target `le = 5·λc`
+- Automatic fallback when trace length is insufficient:
+	- reduces `nsc` to the maximum that fits after filter edge buffers
+	- emits warning text (`nsc_warning`) and flags this in plot banners/output
+	- raises an error only when even one sampling section cannot fit
+- Overview figure with:
+	- raw + leveling fit
+	- roughness + waviness (+ robust mean overlay)
+	- bearing ratio curve with Rmr construction guides (`Cref`, `Rz/4` drop, target level, `Rmr`)
+	- R-parameter table (`Ra`, `Rq`, `Rp`, `Rv`, `Rz`, `Rzx`, `Rt`, `Rsk`, `Rku`, `Rmr`)
+
+## Quick Start
+
+### GUI
+
+```bash
+python gui.py
+```
+
+### CLI
 
 ```bash
 python main.py
 ```
 
-If there are multiple `.xlsx` files in the project root, the script prompts you to pick one.
+If no `--file` is provided, CLI mode auto-prompts to choose an `.xlsx` in the project root.
 
-## Configure File, Sheet, Columns, Units
+## CLI Usage
 
-```bash
-python main.py --file "48743-004 trell sample t1.xlsx" --sheet 0 --x-col 0 --y-col 1 --x-unit mm --y-unit um
-```
-
-You can pass column names instead of indexes:
+Example using explicit file/sheet/columns/units:
 
 ```bash
-python main.py --file "measurements.xlsx" --sheet "TraceData" --x-col "Distance" --y-col "Height" --x-unit mm --y-unit um
+python main.py --file "data/48743-004 trell sample t1.xlsx" --sheet "DATA" --x-col 4 --y-col 5 --x-unit in --y-unit "µin"
 ```
 
-## Notes
-
-- `--sheet` accepts either a zero-based index (`0`) or sheet name (`"TraceData"`).
-- `--x-col` and `--y-col` accept either zero-based indexes or exact column names.
-- `.txt`/`.csv` input still works as before (first two columns are used unless preprocessing is done externally).
-
-## Dependencies For Excel Input
-
-Excel support requires `pandas` and `openpyxl`:
+You can also pass column names instead of indexes:
 
 ```bash
-pip install pandas openpyxl
+python main.py --file "measurements.xlsx" --sheet "TraceData" --x-col "Distance" --y-col "Height" --x-unit mm --y-unit "µm"
 ```
+
+### Important arguments
+
+- `--setting-class {Sc1..Sc5,Custom}` (default `Sc3`)
+- `--short-cutoff` and `--long-cutoff` (override setting-class defaults)
+- `--order` (leveling order: 0, 1, 2, 3)
+- `--plot-level` (show leveling preview)
+- `--no-plot-roughness`
+- `--no-plot-mr`
+
+Note: evaluation length (`le`) and sampling section count (`nsc`) are backend-derived from `λc` and trace length. They are not user-configurable CLI options.
+
+## Input Notes
+
+- `--sheet` accepts a sheet name (for example `DATA`) or zero-based sheet index (`0`).
+- `--x-col` and `--y-col` accept zero-based indexes or exact column names.
+- `.txt`/`.csv` inputs use the first two columns unless pre-processed otherwise.
 
 ## Environment Setup
 
-Use one of these approaches:
+Use one of the following approaches.
 
-### Option 1: pip + venv
+### Option 1: venv + pip
 
 ```bash
 python -m venv .venv
@@ -54,4 +93,4 @@ conda env create -f SurfFin.yml
 conda activate SurfFin
 ```
 
-`SurfFin.yml` is a Conda environment file and cannot be installed with `pip install -r`.
+`SurfFin.yml` is a Conda environment file and is not used with `pip install -r`.
