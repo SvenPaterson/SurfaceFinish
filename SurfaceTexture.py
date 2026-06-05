@@ -1,4 +1,5 @@
 import time, os
+from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -9,6 +10,68 @@ from functools import wraps
 from blume.table import table
 
 class SurfaceTexture():
+
+    @staticmethod
+    def _parse_column_selector(selector):
+        if isinstance(selector, int):
+            return selector
+        if isinstance(selector, str) and selector.strip().isdigit():
+            return int(selector.strip())
+        return selector
+
+    @staticmethod
+    def _read_text_profile(raw_data):
+        try:
+            return np.loadtxt(raw_data, delimiter=",", unpack=True)
+        except ValueError:
+            return np.loadtxt(raw_data, unpack=True)
+
+    @classmethod
+    def _read_excel_profile(cls, raw_data, x_col, y_col, sheet_name=0):
+        try:
+            import pandas as pd
+        except ImportError as exc:
+            raise ImportError(
+                "Reading .xlsx files requires pandas and openpyxl. "
+                "Install with: pip install pandas openpyxl"
+            ) from exc
+
+        x_selector = cls._parse_column_selector(x_col)
+        y_selector = cls._parse_column_selector(y_col)
+
+        df = pd.read_excel(raw_data, sheet_name=sheet_name)
+        if isinstance(df, dict):
+            first_sheet = next(iter(df))
+            df = df[first_sheet]
+
+        if isinstance(x_selector, str):
+            if x_selector not in df.columns:
+                raise ValueError(f"X column '{x_selector}' was not found in sheet '{sheet_name}'.")
+            x_series = df[x_selector]
+        else:
+            x_series = df.iloc[:, x_selector]
+
+        if isinstance(y_selector, str):
+            if y_selector not in df.columns:
+                raise ValueError(f"Y column '{y_selector}' was not found in sheet '{sheet_name}'.")
+            y_series = df[y_selector]
+        else:
+            y_series = df.iloc[:, y_selector]
+
+        x = x_series.to_numpy(dtype=float)
+        y = y_series.to_numpy(dtype=float)
+        valid = np.isfinite(x) & np.isfinite(y)
+        if not np.any(valid):
+            raise ValueError("No valid numeric X/Y pairs found in the selected worksheet columns.")
+
+        return np.vstack((x[valid], y[valid]))
+
+    @classmethod
+    def _load_profile_data(cls, raw_data, x_col=0, y_col=1, sheet_name=0):
+        ext = Path(raw_data).suffix.lower()
+        if ext == ".xlsx":
+            return cls._read_excel_profile(raw_data, x_col=x_col, y_col=y_col, sheet_name=sheet_name)
+        return cls._read_text_profile(raw_data)
     
     def timeit(method):
         @wraps(method)
@@ -21,8 +84,10 @@ class SurfaceTexture():
         return timed
 
     @timeit
-    def __init__(self, raw_data: str, short_cutoff: int, 
-                 long_cutoff: float, order=1, units='mm', **kwargs):
+    def __init__(self, raw_data: str, short_cutoff: int,
+                 long_cutoff: float, order=1,
+                 x_units='mm', y_units='μm',
+                 x_col=0, y_col=1, sheet_name=0, **kwargs):
         """ Process surface texture data
             Currently roughness parameters are calculated on init. Methods can be
             called to plot roughness and material ratio properties.
@@ -51,11 +116,23 @@ class SurfaceTexture():
         kwargs.setdefault('PLOT_ROUGHNESS', False)
         kwargs.setdefault('PLOT_ALL', False)
 
-        self.units = units
+        self.x_units = x_units
+        self.y_units = y_units
         self.raw_data = raw_data
         self.short_cutoff = short_cutoff
         self.long_cutoff = long_cutoff
-        self.primary = np.loadtxt(self.raw_data, delimiter=",", unpack=True)
+        self.order = order
+        self.primary = self._load_profile_data(
+            self.raw_data,
+            x_col=x_col,
+            y_col=y_col,
+            sheet_name=sheet_name,
+        )
+
+        # Keep an immutable copy of the raw input for plotting/inspection.
+        self.raw_data_xy = self.primary.copy()
+        self.level_fit_x = None
+        self.level_fit_y = None
 
         # if profile leveling is called for then fit to line/curve
         if order: 
@@ -77,6 +154,10 @@ class SurfaceTexture():
             y = self.primary[1]
             popt, _ = optimize.curve_fit(func, x, y)
 
+            # Save the leveling fit so it can be plotted alongside raw data later.
+            self.level_fit_x = np.array(x)
+            self.level_fit_y = func(x, *popt)
+
             if kwargs['PLOT_LEVEL'] or kwargs['PLOT_ALL']:
                 if self.order == 1:
                     plt.plot(x, func(x, *popt), 'r-',
@@ -92,16 +173,30 @@ class SurfaceTexture():
                                       np.array(y - func(x, *popt))))
 
 
-        # calc sampling frequency
-        T = self.primary[0][1] - self.primary[0][0]
-        self.Fs = 1 / T
+        # calc sampling frequency (robust to descending/non-uniform x spacing)
+        diffs = np.diff(self.primary[0])
+        diffs = np.abs(diffs[np.isfinite(diffs)])
+        diffs = diffs[diffs > 0]
+        if diffs.size == 0:
+            raise ValueError("Invalid x spacing: unable to compute positive sample spacing from X data.")
+        T = float(np.median(diffs))
+        if not np.isfinite(T) or T <= 0:
+            raise ValueError(f"Invalid x spacing: computed sample spacing T={T}.")
+        self.Fs = 1.0 / T
 
         def gauss_filter(data, cutoff):
-            sigma = self.Fs / (2 * np.pi * cutoff)
-            window = signal.windows.gaussian(self.Fs * cutoff, sigma) /\
+            sigma = abs(self.Fs / (2 * np.pi * cutoff))
+            sigma = max(sigma, np.finfo(float).eps)
+
+            window_len = int(round(abs(self.Fs * cutoff)))
+            window_len = max(window_len, 3)
+            if window_len % 2 == 0:
+                window_len += 1
+
+            window = signal.windows.gaussian(window_len, sigma) /\
                     (sigma * np.sqrt(2 * np.pi))
             # plt.plot(window)
-            window = [x for x in window if x > 0]
+            window = np.asarray([x for x in window if x > 0], dtype=float)
             # plt.plot(window, 'r', linestyle='--')
             # plt.show()
             return signal.fftconvolve(data, window, mode="same")
@@ -109,6 +204,20 @@ class SurfaceTexture():
         # buffer used for clipping valid data
         prim_buff = int(self.short_cutoff / (2 * T))
         wav_buff = int(self.long_cutoff / (2 * T))
+
+        # Validate cutoffs vs available data length
+        n_pts = self.primary[0].size
+        total_buff = 2 * (prim_buff + wav_buff)
+        if prim_buff < 1 or wav_buff < 1 or total_buff >= n_pts - 4:
+            raise ValueError(
+                "Filter cutoffs are incompatible with the data length / spacing.\n"
+                f"  Sample spacing T = {T:.6g} {self.x_units}\n"
+                f"  Short cutoff = {self.short_cutoff} {self.x_units} -> buffer {prim_buff} samples\n"
+                f"  Long cutoff  = {self.long_cutoff} {self.x_units} -> buffer {wav_buff} samples\n"
+                f"  Trace length = {n_pts} samples; need < {n_pts - 4} buffer but require {total_buff}.\n"
+                "  Tip: cutoffs must be in the same distance units as the X data "
+                f"({self.x_units}). For inch data try short=9.8425e-5, long=0.031496."
+            )
 
         # filter primary using short wave cutoff and clip valid data
         freq = 1 / self.short_cutoff
@@ -128,17 +237,29 @@ class SurfaceTexture():
 
         # generate roughness parameters
         len_wav_x = len(wav_x)
+        if len_wav_x == 0:
+            raise ValueError(
+                "No samples remain after filtering. Cutoffs are too large for the "
+                "available trace length. Reduce cutoffs or verify they are in the "
+                f"same units as the X data ({self.x_units})."
+            )
         self.R_params = {}
         self.R_params['Ra'] = (sum(map(abs, self.roughness[1]))
-                            / len_wav_x, "μm")
+                            / len_wav_x, self.y_units)
         self.R_params['Rq'] = (np.sqrt(sum(map(np.square, self.roughness[1]))
-                            / len_wav_x), "μm")
+                            / len_wav_x), self.y_units)
         self.R_params['Rsk'] = (sum([x ** 3 for x in self.roughness[1]]) /
                              ((self.R_params['Rq'][0] ** 3) * len_wav_x), "")
         self.R_params['Rku'] = (sum([x ** 4 for x in self.roughness[1]]) /
                              ((self.R_params['Rq'][0] ** 4) * len_wav_x), "")
-        self.R_params['Rt'] = (max(self.roughness[1]) - min(self.roughness[1]),
-                            "μm")
+        # ISO 4287 amplitude parameters (Rp/Rv on filtered roughness profile)
+        Rp = float(np.max(self.roughness[1]))
+        Rv = float(abs(np.min(self.roughness[1])))
+        Rz = Rp + Rv
+        self.R_params['Rp'] = (Rp, self.y_units)
+        self.R_params['Rv'] = (Rv, self.y_units)
+        self.R_params['Rz'] = (Rz, self.y_units)
+        self.R_params['Rt'] = (Rz, self.y_units)
         
         if kwargs['PLOT_ROUGHNESS'] or kwargs['PLOT_ALL']:
             self.plot_roughness()
@@ -169,8 +290,8 @@ class SurfaceTexture():
         # set x and y limits
         x_lim = (self.primary[0][0], self.primary[0][-1])
         for a in axs:
-            a.set_xlabel("size, mm")
-            a.set_ylabel("height, μm")
+            a.set_xlabel(f"size, {self.x_units}")
+            a.set_ylabel(f"height, {self.y_units}")
             a.set_xlim(x_lim)
             if y_lim: a.set_ylim(y_lim)
             a.axhline(0, color="black", linewidth=0.5)
@@ -391,6 +512,120 @@ class SurfaceTexture():
         axs[0, 1].set_title("Material Ratio")
         plt.tight_layout()
         plt.draw()
+
+    def compute_Rmr(self, Cref=5.0):
+        """Material ratio at slicing level (peak_at_Cref% - Rz/4).
+
+        Stores the result on ``self.R_params['Rmr']`` and saves the slicing
+        level on ``self.Rmr_target_level`` for plotting.
+        """
+        rough = self.roughness[1]
+        n = rough.size
+        unit_label = f"% (@Rz/4, Cref={Cref:g}%)"
+        if n == 0:
+            self.R_params['Rmr'] = (0.0, unit_label)
+            self.Rmr_target_level = 0.0
+            return
+        Rz = self.R_params['Rz'][0]
+        sorted_desc = np.sort(rough)[::-1]
+        idx = max(0, min(n - 1, int(round(Cref / 100.0 * n))))
+        c0 = sorted_desc[idx]
+        target = c0 - Rz / 4.0
+        above = int(np.sum(sorted_desc >= target))
+        Rmr = above / n * 100.0
+        self.R_params['Rmr'] = (Rmr, unit_label)
+        self.Rmr_target_level = target
+        self.Rmr_Cref_level = c0
+
+    def build_overview_figure(self, Cref=5.0):
+        """Build a matplotlib ``Figure`` (no pyplot) suitable for GUI embedding.
+
+        The figure contains four panels:
+          * Raw data with the polynomial leveling fit overlaid
+          * Roughness profile with the waviness curve overlaid (red)
+          * Bearing ratio (Abbott) curve, depth on y-axis in y-units, % on x-axis
+          * R-parameters table
+        """
+        from matplotlib.figure import Figure
+
+        if not hasattr(self, 'material_ratio'):
+            self.get_material_ratio()
+        self.compute_Rmr(Cref=Cref)
+
+        fig = Figure(figsize=(11, 7.5))
+        gs = fig.add_gridspec(2, 2,
+                              width_ratios=[2, 1],
+                              hspace=0.40, wspace=0.30)
+        ax_raw = fig.add_subplot(gs[0, 0])
+        ax_bear = fig.add_subplot(gs[0, 1])
+        ax_rough = fig.add_subplot(gs[1, 0])
+        ax_table = fig.add_subplot(gs[1, 1])
+
+        # --- Raw data + leveling fit -------------------------------------
+        ax_raw.plot(self.raw_data_xy[0], self.raw_data_xy[1],
+                    lw=0.5, color='steelblue', label='raw')
+        if self.level_fit_y is not None:
+            ax_raw.plot(self.level_fit_x, self.level_fit_y,
+                        color='red', lw=1.0,
+                        label=f'order {self.order} fit')
+            ax_raw.legend(fontsize=8, loc='best')
+        ax_raw.set_title('Raw Data + Leveling Fit')
+        ax_raw.set_xlabel(f'size, {self.x_units}')
+        ax_raw.set_ylabel(f'height, {self.y_units}')
+        ax_raw.grid(True, ls=':', alpha=0.5)
+
+        # --- Roughness + waviness ---------------------------------------
+        ax_rough.plot(*self.roughness, lw=0.5, color='green', label='roughness')
+        ax_rough.plot(*self.waviness, lw=0.9, color='red', label='waviness')
+        ax_rough.set_title(
+            f'Roughness + Waviness  (\u03bbc={self.long_cutoff}{self.x_units}, '
+            f'\u03bbs={self.short_cutoff}{self.x_units})'
+        )
+        ax_rough.set_xlabel(f'size, {self.x_units}')
+        ax_rough.set_ylabel(f'height, {self.y_units}')
+        ax_rough.axhline(0, color='black', lw=0.5)
+        ax_rough.legend(fontsize=8, loc='best')
+        ax_rough.grid(True, ls=':', alpha=0.5)
+
+        # --- Bearing ratio curve ----------------------------------------
+        # self.material_ratio[0] is %; self.material_ratio[1] is depth
+        ax_bear.plot(self.material_ratio[0], self.material_ratio[1],
+                     color='blue', lw=1.0)
+        ax_bear.set_title('Bearing Ratio Curve')
+        ax_bear.set_xlabel('Material Ratio %')
+        ax_bear.set_ylabel(f'depth, {self.y_units}')
+        ax_bear.set_xlim(0, 100)
+        ax_bear.grid(True, ls=':', alpha=0.5)
+        if hasattr(self, 'Rmr_target_level'):
+            ax_bear.axhline(self.Rmr_target_level, color='gray',
+                            ls='--', lw=0.7,
+                            label=f'Rz/4 slice')
+            Rmr_val = self.R_params['Rmr'][0]
+            ax_bear.axvline(Rmr_val, color='magenta', ls=':', lw=0.8,
+                            label=f'Rmr = {Rmr_val:.2f}%')
+            ax_bear.legend(fontsize=7, loc='best')
+
+        # --- R-parameter table -------------------------------------------
+        ax_table.set_axis_off()
+        rows = ['Ra', 'Rp', 'Rt', 'Rv', 'Rz', 'Rq', 'Rsk', 'Rmr']
+        cells = []
+        for r in rows:
+            v, u = self.R_params.get(r, ('-', ''))
+            if isinstance(v, (int, float)):
+                cells.append([f'{v:.4f}', u])
+            else:
+                cells.append([str(v), u])
+        tbl = ax_table.table(cellText=cells,
+                             rowLabels=rows,
+                             colLabels=['Value', 'Unit'],
+                             loc='center', cellLoc='center')
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(9)
+        tbl.scale(1, 1.4)
+        ax_table.set_title(f'R-Parameters  (Cref = {Cref:g}%)', fontsize=10)
+
+        fig.suptitle(os.path.basename(self.raw_data), fontsize=11)
+        return fig
 
     def __str__(self):
         p = f'\nProcessed {self.raw_data} with λc = {self.long_cutoff}mm\n' \
