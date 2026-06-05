@@ -47,8 +47,8 @@ class SurfaceFinishGUI(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("SurfaceFinish - Analysis")
-        self.geometry("1720x900")
-        self.minsize(1450, 760)
+        self.geometry("1912x900")
+        self.minsize(1642, 760)
 
         self._msg_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self._worker: threading.Thread | None = None

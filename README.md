@@ -1,5 +1,7 @@
 # SurfaceFinish
 
+![Overview](overview.png)
+
 Surface roughness analysis toolkit with both CLI and Tkinter GUI front ends.
 
 The current implementation targets:
