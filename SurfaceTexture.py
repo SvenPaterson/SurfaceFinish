@@ -399,6 +399,11 @@ class SurfaceTexture():
         start = edge_buff + (usable - le_samples) // 2
         end = start + le_samples
 
+        # Store window indices for potential re-computation (e.g. comparison).
+        self._le_start = start
+        self._le_end = end
+        self._lsc_samples = lsc_samples
+
         wav_x = self.primary[0][start:end]
         denoised_primary = denoised_primary_full[start:end]
         waviness = waviness_full[start:end]
@@ -426,19 +431,8 @@ class SurfaceTexture():
                 "available trace length. Reduce cutoffs or verify they are in the "
                 f"same units as the X data ({self.x_units})."
             )
-        self.R_params = {}
-        # Field parameters (ISO 21920-2 §4) — averaged over le
-        self.R_params['Ra'] = (float(np.mean(np.abs(roughness))), self.y_units)
-        Rq = float(np.sqrt(np.mean(roughness ** 2)))
-        self.R_params['Rq'] = (Rq, self.y_units)
-        if Rq > 0:
-            self.R_params['Rsk'] = (float(np.mean(roughness ** 3)) / (Rq ** 3), "")
-            self.R_params['Rku'] = (float(np.mean(roughness ** 4)) / (Rq ** 4), "")
-        else:
-            self.R_params['Rsk'] = (0.0, "")
-            self.R_params['Rku'] = (0.0, "")
-
-        # Per-section peak/valley parameters (ISO 21920-3 §5.3 / Table 4)
+        self.R_params = self._compute_r_params(roughness, self.nsc, lsc_samples, self.y_units)
+        # Expose per-section values for plotting overlays.
         section_Rp = []
         section_Rv = []
         section_Rz = []
@@ -452,22 +446,6 @@ class SurfaceTexture():
         self.section_Rp_values = section_Rp
         self.section_Rv_values = section_Rv
         self.section_Rz_values = section_Rz
-
-        # ISO 21920-3:2021 amplitude parameters
-        # Rp = mean of section maxima ; Rv = mean of section |minima|
-        # Rz = mean section peak-to-valley ; Rzx = max section peak-to-valley
-        # Rt = max-min over the full evaluation length
-        Rp_iso = float(np.mean(section_Rp))
-        Rv_iso = float(np.mean(section_Rv))
-        Rz_iso = float(np.mean(section_Rz))
-        Rzx_iso = float(np.max(section_Rz))
-        Rt_iso = float(np.max(roughness) - np.min(roughness))
-
-        self.R_params['Rp'] = (Rp_iso, self.y_units)
-        self.R_params['Rv'] = (Rv_iso, self.y_units)
-        self.R_params['Rz'] = (Rz_iso, self.y_units)
-        self.R_params['Rzx'] = (Rzx_iso, self.y_units)
-        self.R_params['Rt'] = (Rt_iso, self.y_units)
 
         # ----- ISO 16610-31 robust Gaussian regression (2nd order) --------
         # Used as the L-operator for the Rk-family per ISO 21920-3 Table 1.
@@ -486,6 +464,113 @@ class SurfaceTexture():
 
         if kwargs['PLOT_MR'] or kwargs['PLOT_ALL']:
             self.plot_material_ratio()
+
+    # ------------------------------------------------------------------
+    # R-parameter computation (reusable across filter pipelines).
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _compute_r_params(roughness, nsc, lsc_samples, y_units, Cref=5.0):
+        """Compute R-family parameters from a roughness array.
+
+        Parameters
+        ----------
+        roughness : ndarray
+            1-D roughness profile (evaluation length).
+        nsc : int
+            Number of sampling sections.
+        lsc_samples : int
+            Samples per sampling section.
+        y_units : str
+            Unit label for amplitude parameters.
+        Cref : float
+            Material ratio reference percentage for Rmr.
+
+        Returns
+        -------
+        dict
+            {param_name: (value, unit)} for Ra, Rq, Rsk, Rku, Rp, Rv, Rz, Rt, Rmr.
+        """
+        params = {}
+        params['Ra'] = (float(np.mean(np.abs(roughness))), y_units)
+        Rq = float(np.sqrt(np.mean(roughness ** 2)))
+        params['Rq'] = (Rq, y_units)
+        if Rq > 0:
+            params['Rsk'] = (float(np.mean(roughness ** 3)) / (Rq ** 3), "")
+            params['Rku'] = (float(np.mean(roughness ** 4)) / (Rq ** 4), "")
+        else:
+            params['Rsk'] = (0.0, "")
+            params['Rku'] = (0.0, "")
+
+        section_Rp = []
+        section_Rv = []
+        section_Rz = []
+        for i in range(nsc):
+            seg = roughness[i * lsc_samples:(i + 1) * lsc_samples]
+            sp = float(np.max(seg))
+            sv = float(abs(np.min(seg)))
+            section_Rp.append(sp)
+            section_Rv.append(sv)
+            section_Rz.append(sp + sv)
+
+        params['Rp'] = (float(np.mean(section_Rp)), y_units)
+        params['Rv'] = (float(np.mean(section_Rv)), y_units)
+        params['Rz'] = (float(np.mean(section_Rz)), y_units)
+        params['Rt'] = (float(np.max(roughness) - np.min(roughness)), y_units)
+
+        # Rmr: material ratio at (peak_at_Cref% - Rz/4)
+        n = roughness.size
+        Rz = params['Rz'][0]
+        unit_label = f"% (@Rz/4, Cref={Cref:g}%)"
+        if n > 0:
+            sorted_desc = np.sort(roughness)[::-1]
+            idx = max(0, min(n - 1, int(round(Cref / 100.0 * n))))
+            c0 = sorted_desc[idx]
+            target = c0 - Rz / 4.0
+            above = int(np.sum(sorted_desc >= target))
+            params['Rmr'] = (above / n * 100.0, unit_label)
+        else:
+            params['Rmr'] = (0.0, unit_label)
+        return params
+
+    # ------------------------------------------------------------------
+    # Multi-standard comparison computation.
+    # ------------------------------------------------------------------
+    def compute_comparison_params(self, Cref=5.0):
+        """Compute R-parameters under ISO 21920, ISO 4287, and ASME B46.1 pipelines.
+
+        ISO 21920: S-filter (λs) + L-filter (λc) — already computed.
+        ISO 4287 / B46.1 (Gaussian): L-filter (λc) only, no S-filter.
+
+        Stores results in self.comparison_params as:
+            {'ISO 21920': {...}, 'ISO 4287': {...}, 'B46.1': {...}}
+        """
+        # Recompute ISO 21920 Rmr with the requested Cref.
+        self.compute_Rmr(Cref=Cref)
+        # ISO 21920 values are already in self.R_params.
+        iso21920_params = {k: self.R_params[k] for k in
+                          ['Ra', 'Rq', 'Rp', 'Rv', 'Rz', 'Rt', 'Rsk', 'Rku', 'Rmr']}
+
+        # ISO 4287 / B46.1: apply only L-filter (λc) directly to primary
+        # (skip S-filter). Use the same Gaussian filter and evaluation window.
+        waviness_no_s_full = self._gauss_filter(self.primary[1], 1.0 / self.long_cutoff)
+        roughness_no_s_full = self.primary[1] - waviness_no_s_full
+
+        # Slice to the same evaluation window used for ISO 21920.
+        roughness_no_s = roughness_no_s_full[self._le_start:self._le_end]
+
+        iso4287_params = self._compute_r_params(
+            roughness_no_s, self.nsc, self._lsc_samples, self.y_units, Cref=Cref
+        )
+        # B46.1 with Gaussian filter is identical to ISO 4287.
+        b461_params = self._compute_r_params(
+            roughness_no_s, self.nsc, self._lsc_samples, self.y_units, Cref=Cref
+        )
+
+        self.comparison_params = {
+            'ISO 21920': iso21920_params,
+            'ISO 4287': iso4287_params,
+            'B46.1': b461_params,
+        }
 
     # ------------------------------------------------------------------
     # ISO 16610-31 robust Gaussian regression filter, second order.
@@ -949,7 +1034,7 @@ class SurfaceTexture():
         self.Rmr_Cref_level = c0
         self.Rmr_Rz4_drop = Rz / 4.0
 
-    def build_overview_figure(self, Cref=5.0, y_lim=None):
+    def build_overview_figure(self, Cref=5.0, y_lim=None, comparison=False):
         """Build a matplotlib ``Figure`` (no pyplot) suitable for GUI embedding.
 
         The figure contains four panels:
@@ -957,6 +1042,11 @@ class SurfaceTexture():
           * Roughness profile with the waviness curve overlaid (red)
           * Bearing ratio (Abbott) curve, depth on y-axis in y-units, % on x-axis
           * R-parameters table
+
+        Parameters
+        ----------
+        comparison : bool
+            If True, show multi-standard comparison table (ISO 21920 / ISO 4287 / B46.1).
         """
         from matplotlib.figure import Figure
 
@@ -1061,23 +1151,50 @@ class SurfaceTexture():
 
         # --- R-parameter table -------------------------------------------
         ax_table.set_axis_off()
-        rows = ['Ra', 'Rq', 'Rp', 'Rv', 'Rz', 'Rzx', 'Rt', 'Rsk', 'Rku', 'Rmr']
-        cells = []
-        for r in rows:
-            v, u = self.R_params.get(r, ('-', ''))
-            if isinstance(v, (int, float)):
-                cells.append([self.format_param_value(r, v, u), u])
-            else:
-                cells.append([str(v), u])
-        tbl = ax_table.table(cellText=cells,
-                     rowLabels=rows,
-                     colLabels=['Value', 'Unit'],
-                     loc='center', cellLoc='center',
-                     colWidths=[0.43, 0.57])
-        tbl.auto_set_font_size(False)
-        tbl.set_fontsize(10)
-        tbl.scale(1.08, 1.42)
-        ax_table.set_title('R-Parameters', fontsize=10, pad=12)
+        if comparison and hasattr(self, 'comparison_params'):
+            rows = ['Ra', 'Rq', 'Rp', 'Rv', 'Rz', 'Rt', 'Rsk', 'Rku', 'Rmr']
+            standards = ['ISO 21920', 'ISO 4287', 'B46.1']
+            cells = []
+            for r in rows:
+                row_cells = []
+                for std in standards:
+                    v, u = self.comparison_params[std].get(r, ('-', ''))
+                    if isinstance(v, (int, float)):
+                        row_cells.append(self.format_param_value(r, v, u))
+                    else:
+                        row_cells.append(str(v))
+                # Append unit from first standard (all share same units).
+                _, u = self.comparison_params[standards[0]].get(r, ('-', ''))
+                row_cells.append(u)
+                cells.append(row_cells)
+            col_labels = ['ISO 21920', 'ISO 4287', 'B46.1', 'Unit']
+            tbl = ax_table.table(cellText=cells,
+                         rowLabels=rows,
+                         colLabels=col_labels,
+                         loc='center', cellLoc='center',
+                         colWidths=[0.25, 0.25, 0.25, 0.15])
+            tbl.auto_set_font_size(False)
+            tbl.set_fontsize(8)
+            tbl.scale(1.08, 1.42)
+            ax_table.set_title('R-Parameters (Multi-Standard)', fontsize=9, pad=12)
+        else:
+            rows = ['Ra', 'Rq', 'Rp', 'Rv', 'Rz', 'Rt', 'Rsk', 'Rku', 'Rmr']
+            cells = []
+            for r in rows:
+                v, u = self.R_params.get(r, ('-', ''))
+                if isinstance(v, (int, float)):
+                    cells.append([self.format_param_value(r, v, u), u])
+                else:
+                    cells.append([str(v), u])
+            tbl = ax_table.table(cellText=cells,
+                         rowLabels=rows,
+                         colLabels=['Value', 'Unit'],
+                         loc='center', cellLoc='center',
+                         colWidths=[0.43, 0.57])
+            tbl.auto_set_font_size(False)
+            tbl.set_fontsize(10)
+            tbl.scale(1.08, 1.42)
+            ax_table.set_title('R-Parameters', fontsize=10, pad=12)
 
         # --- ISO conformance banner --------------------------------------
         banner = self._iso_banner_text()

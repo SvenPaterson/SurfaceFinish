@@ -65,6 +65,7 @@ class SurfaceFinishGUI(tk.Tk):
         self.var_setting_class = tk.StringVar(value=DEFAULT_SETTING_CLASS)
         self.var_order = tk.IntVar(value=1)
         self.var_cref = tk.StringVar(value="5")
+        self.var_compare_standards = tk.BooleanVar(value=False)
 
         self._build_ui()
         self.after(100, self._drain_queue)
@@ -193,6 +194,9 @@ class SurfaceFinishGUI(tk.Tk):
         ttk.Entry(params, textvariable=self.var_cref, width=10).grid(
             row=1, column=1, sticky="w", padx=4, pady=3
         )
+        ttk.Checkbutton(
+            params, text="Compare Standards", variable=self.var_compare_standards
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=4, pady=3)
 
         # --- Action row ---
         actions = ttk.Frame(parent)
@@ -431,6 +435,7 @@ class SurfaceFinishGUI(tk.Tk):
             "setting_class": setting_class,
             "order": order,
             "cref": cref,
+            "compare_standards": self.var_compare_standards.get(),
         }
 
     def _validate_inputs(self) -> dict | None:
@@ -547,7 +552,10 @@ class SurfaceFinishGUI(tk.Tk):
                 sheet_name=params["sheet"],
                 setting_class=params.get("setting_class"),
             )
-            fig = st.build_overview_figure(Cref=params["cref"])
+            comparison = params.get("compare_standards", False)
+            if comparison:
+                st.compute_comparison_params(Cref=params["cref"])
+            fig = st.build_overview_figure(Cref=params["cref"], comparison=comparison)
             summary = self._summarize(st)
             self._msg_queue.put(("done", (fig, summary)))
         except Exception as exc:  # noqa: BLE001
