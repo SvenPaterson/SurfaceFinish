@@ -27,7 +27,28 @@ The current implementation targets:
 	- raw + leveling fit
 	- roughness + waviness (+ robust mean overlay)
 	- bearing ratio curve with Rmr construction guides (`Cref`, `Rz/4` drop, target level, `Rmr`)
-	- R-parameter table (`Ra`, `Rq`, `Rp`, `Rv`, `Rz`, `Rzx`, `Rt`, `Rsk`, `Rku`, `Rmr`)
+	- R-parameter table (`Ra`, `Rq`, `Rp`, `Rv`, `Rz`, `Rt`, `Rsk`, `Rku`, `Rmr`)
+- Multi-standard comparison mode (GUI checkbox):
+	- side-by-side table columns for ISO 21920, ISO 4287, and ASME B46.1
+	- comparison uses each standard's intended roughness pipeline
+	- ISO 4287 and ASME B46.1 are often numerically identical in this tool (Gaussian-based path), which is useful for customer-facing comparisons
+
+## Standards Comparison (GUI)
+
+In the GUI, enable **Compare Standards** before clicking **Run Analysis** to render a side-by-side parameter table.
+
+- ISO 21920 column: S-filter (`λs`) then L-filter (`λc`)
+- ISO 4287 column: L-filter (`λc`) on primary profile (no S-filter)
+- ASME B46.1 column: Gaussian path aligned to the ISO 4287 comparison path
+
+Displayed parameters in comparison mode:
+
+- `Ra`, `Rq`, `Rp`, `Rv`, `Rz`, `Rt`, `Rsk`, `Rku`, `Rmr`
+
+Notes:
+
+- `Rmr` is computed per column using the selected `Cref`.
+- `Rt` is kept as the total-height metric in the table; `Rzx` is not shown.
 
 ## Quick Start
 
@@ -36,6 +57,8 @@ The current implementation targets:
 ```bash
 python gui.py
 ```
+
+GUI tip for inch data: use the **inch defaults** button (or Sc-class defaults with unit conversion) so `λs`/`λc` are in the same X-distance unit as your input trace.
 
 ### CLI
 
