@@ -121,6 +121,7 @@ _MM_PER_UNIT = {
     "in": 1.0 / 25.4,
     "inch": 1.0 / 25.4,
     "nm": 1_000_000.0,
+    "uin": 1_000_000.0 / 25.4,
 }
 
 
@@ -128,26 +129,45 @@ def _normalize_unit(unit: str) -> str:
     text = str(unit or "").strip().lower()
     text = text.replace("μ", "u").replace("µ", "u")
     return {"um": "um", "umeter": "um", "umetre": "um",
-            "uin": "in", "uinch": "in"}.get(text, text)
+            "uinch": "uin"}.get(text, text)
 
 
 def convert_mm_to(length_mm: float, unit: str) -> float:
     """Convert a millimetre length to ``unit``.
 
     Recognised units (case-insensitive): ``mm``, ``cm``, ``m``, ``μm`` / ``um``,
-    ``in`` / ``inch``, ``nm``. Raises ``ValueError`` for unknown units.
+    ``in`` / ``inch``, ``μin`` / ``uin``, ``nm``. Raises ``ValueError`` for
+    unknown units.
     """
     norm = _normalize_unit(unit)
     if norm in {"um", "u m", "u-m"}:
         return length_mm * 1000.0
     if norm in {"in", "u-in", "u in"}:
-        # Note: micro-inch (uin) is *length*, not the working unit; treat as inch
-        # if the user provided "in". Micro-inch traces still use inch for X.
         return length_mm / 25.4
+    if norm == "uin":
+        return length_mm * 1_000_000.0 / 25.4
     factor = _MM_PER_UNIT.get(norm)
     if factor is None:
         raise ValueError(f"Unsupported length unit for conversion: {unit!r}")
     return length_mm * factor
+
+
+def convert_length(value: float, from_unit: str, to_unit: str) -> float:
+    """Convert ``value`` from one length unit to another.
+
+    Pivots through millimetres so the same alias rules as
+    :func:`convert_mm_to` apply to both sides. Recognised:
+    ``mm``, ``cm``, ``m``, ``μm`` / ``um``, ``in`` / ``inch``,
+    ``μin`` / ``uin``, ``nm``.
+    """
+    if value == 0:
+        return 0.0
+    if _normalize_unit(from_unit) == _normalize_unit(to_unit):
+        return float(value)
+    # value [from_unit] → mm
+    mm = float(value) / convert_mm_to(1.0, from_unit)
+    # mm → to_unit
+    return convert_mm_to(mm, to_unit)
 
 
 # ---------------------------------------------------------------------------

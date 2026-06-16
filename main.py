@@ -29,8 +29,10 @@ def _pick_root_xlsx(root_dir: Path) -> Path:
 
 
 def build_parser() -> ArgumentParser:
-    parser = ArgumentParser(description="Surface finish analysis for TXT/CSV/XLSX traces")
-    parser.add_argument("--file", help="Path to source data file (.txt/.csv/.xlsx)")
+    parser = ArgumentParser(
+        description="Surface finish analysis for TXT/CSV/XLSX/PRO traces"
+    )
+    parser.add_argument("--file", help="Path to source data file (.txt/.csv/.xlsx/.pro)")
     parser.add_argument(
         "--sheet",
         default=0,

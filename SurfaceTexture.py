@@ -13,8 +13,65 @@ from iso21920 import (
     SETTING_CLASSES,
     DEFAULT_SETTING_CLASS,
     convert_mm_to,
+    convert_length,
     get_setting_class,
 )
+
+
+class TraceTooShortError(ValueError):
+    """Raised when the trace cannot accommodate one full λc sampling length.
+
+    Carries structured context so callers (e.g. the GUI) can offer recovery
+    options such as switching to a smaller setting class or forcing the run
+    via the ``allow_short_trace`` override.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        suggested_class: str | None = None,
+        current_class: str | None = None,
+        short_cutoff: float | None = None,
+        long_cutoff: float | None = None,
+        x_units: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.suggested_class = suggested_class
+        self.current_class = current_class
+        self.short_cutoff = short_cutoff
+        self.long_cutoff = long_cutoff
+        self.x_units = x_units
+
+
+def _largest_fitting_setting_class(n_pts: int, T: float, x_units: str) -> str | None:
+    """Return the largest ISO 21920-3 setting class whose λc + buffers fit.
+
+    Walks ``SETTING_CLASSES`` in ascending order (Sc1 → Sc5) and returns
+    the *last* class for which ``max_nsc_that_fits >= 1`` — i.e. the most
+    conservative class the standard could still allow. Returns ``None``
+    if even Sc1 does not fit.
+
+    Args:
+        n_pts: Number of samples in the trace.
+        T: Sample spacing in the data's X distance unit.
+        x_units: The data's X distance unit (used to convert canonical
+            millimetre cutoffs).
+    """
+    best: str | None = None
+    for name, sc in SETTING_CLASSES.items():
+        try:
+            ls = convert_mm_to(sc.lambda_s_mm, x_units)
+            lc = convert_mm_to(sc.lambda_c_mm, x_units)
+        except ValueError:
+            continue
+        edge_buff = int(ls / (2 * T)) + int(lc / (2 * T))
+        lsc_samples = max(int(round(lc / T)), 1)
+        usable = n_pts - 2 * edge_buff
+        max_nsc_fits = usable // lsc_samples if lsc_samples > 0 else 0
+        if max_nsc_fits >= 1:
+            best = name
+    return best
 
 
 class SurfaceTexture():
@@ -137,11 +194,46 @@ class SurfaceTexture():
         return np.vstack((x[valid], y[valid]))
 
     @classmethod
-    def _load_profile_data(cls, raw_data, x_col=0, y_col=1, sheet_name=0):
+    def _load_profile_data_with_units(
+        cls, raw_data, x_col=0, y_col=1, sheet_name=0, pro_target_system=None
+    ):
+        """Load profile XY plus optional file-declared (x_unit, y_unit).
+
+        Most formats (TXT/CSV/XLSX) carry no unit metadata, so they return
+        ``(profile, None, None)``. Digital Surf ``.pro`` files declare X/Y
+        units in their header and surface them here so the caller can adopt
+        them before deriving filter cutoffs.
+
+        ``pro_target_system`` (``"Metric"`` / ``"Standard"`` / ``None``)
+        forwards to :func:`pro_reader.read_pro_profile`, allowing callers to
+        force a ``.pro`` file into the opposite unit system.
+        """
         ext = Path(raw_data).suffix.lower()
         if ext == ".xlsx":
-            return cls._read_excel_profile(raw_data, x_col=x_col, y_col=y_col, sheet_name=sheet_name)
-        return cls._read_text_profile(raw_data)
+            profile = cls._read_excel_profile(
+                raw_data, x_col=x_col, y_col=y_col, sheet_name=sheet_name
+            )
+            return profile, None, None
+        if ext == ".pro":
+            from pro_reader import read_pro_profile
+            profile, x_unit, y_unit = read_pro_profile(
+                raw_data, target_system=pro_target_system
+            )
+            return profile, x_unit, y_unit
+        return cls._read_text_profile(raw_data), None, None
+
+    @classmethod
+    def _load_profile_data(
+        cls, raw_data, x_col=0, y_col=1, sheet_name=0, pro_target_system=None
+    ):
+        profile, _x_unit, _y_unit = cls._load_profile_data_with_units(
+            raw_data,
+            x_col=x_col,
+            y_col=y_col,
+            sheet_name=sheet_name,
+            pro_target_system=pro_target_system,
+        )
+        return profile
     
     def timeit(method):
         @wraps(method)
@@ -157,8 +249,11 @@ class SurfaceTexture():
     def __init__(self, raw_data: str, short_cutoff=None,
                  long_cutoff=None, order=1,
                  x_units='mm', y_units='μm',
+                 source_x_units=None, source_y_units=None,
                  x_col=0, y_col=1, sheet_name=0,
                  setting_class=None,
+                 pro_target_system=None,
+                 allow_short_trace=False,
                  **kwargs):
         """Process a surface profile per ISO 21920-3:2021 / ISO 21920-2:2021.
 
@@ -171,19 +266,43 @@ class SurfaceTexture():
         * If the trace cannot accommodate 5 sections plus the filter
           end-buffers, ``nsc`` is automatically reduced toward 1 and a
           warning is emitted on ``self.nsc_warning``.
-        * If even one full ``λc`` section will not fit, a ``ValueError`` is
-          raised suggesting a smaller setting class.
+        * If even one full ``λc`` section will not fit, a
+          :class:`TraceTooShortError` is raised suggesting the largest
+          setting class whose λc *will* fit.
 
         Args:
-            raw_data: 2-column data file (.txt/.csv/.xlsx).
-            short_cutoff: λs in the data's X distance unit. Overrides class.
-            long_cutoff: λc in the data's X distance unit. Overrides class.
+            raw_data: 2-column data file (.txt/.csv/.xlsx) or Digital Surf
+                profile (.pro).
+            short_cutoff: λs in the *report* X distance unit
+                (``x_units``). Overrides the setting class.
+            long_cutoff: λc in the *report* X distance unit
+                (``x_units``). Overrides the setting class.
             order: Polynomial leveling order (0 skips, 1..3).
-            x_units / y_units: Display units for the axes.
-            x_col / y_col / sheet_name: Column / sheet selectors.
+            x_units / y_units: **Report** units — the X / Y units the
+                figure, parameter table, and cutoffs are expressed in.
+                Profile data is converted into this frame at load time.
+            source_x_units / source_y_units: Units the raw data file is in.
+                For ``.pro`` files the loader populates these from the file
+                header when not supplied. For TXT / CSV / XLSX, when
+                ``None`` the source is assumed to match the report units
+                (legacy behaviour).
+            x_col / y_col / sheet_name: Column / sheet selectors. Ignored
+                for ``.pro`` files.
             setting_class: ISO 21920-3 setting class name ("Sc1".."Sc5",
                 or None to default to "Sc3"). Cutoffs inherit from the class
                 unless explicitly overridden.
+            pro_target_system: Deprecated. Retained for backward
+                compatibility; superseded by the
+                ``source_x_units`` / ``source_y_units`` + ``x_units`` /
+                ``y_units`` pair (the loader now reads .pro header units
+                and ``SurfaceTexture`` converts source → report uniformly).
+            allow_short_trace: When True, bypass the trace-too-short
+                guard. The filter end-buffers are clamped, ``nsc`` is forced
+                to 1, and ``self.short_trace_override`` is populated with a
+                warning. The figure banner flags the result as
+                non-conformant. Use only when the user has explicitly
+                acknowledged the compromise (edge artefacts will be
+                significant).
             **kwargs: PLOT_LEVEL, PLOT_MR, PLOT_ROUGHNESS, PLOT_ALL flags.
         """
 
@@ -197,6 +316,40 @@ class SurfaceTexture():
         self.raw_data = raw_data
         self.order = order
 
+        # Load the profile first. For .pro files the header declares units;
+        # we keep them as the *source* unit so we can convert into the
+        # caller-requested report frame below.
+        self.primary, file_x_unit, file_y_unit = self._load_profile_data_with_units(
+            self.raw_data,
+            x_col=x_col,
+            y_col=y_col,
+            sheet_name=sheet_name,
+            pro_target_system=pro_target_system,
+        )
+
+        # Resolve effective source units.
+        # Priority: explicit kwarg > file-declared (.pro header) > report unit.
+        eff_source_x = source_x_units or file_x_unit or self.x_units
+        eff_source_y = source_y_units or file_y_unit or self.y_units
+        self.source_x_units = eff_source_x
+        self.source_y_units = eff_source_y
+
+        # Convert the profile from source units → report units. ``primary``
+        # is a 2 × N ndarray where row 0 is X and row 1 is Y.
+        try:
+            x_factor = convert_length(1.0, eff_source_x, self.x_units)
+        except ValueError:
+            x_factor = 1.0
+        try:
+            y_factor = convert_length(1.0, eff_source_y, self.y_units)
+        except ValueError:
+            y_factor = 1.0
+        if x_factor != 1.0 or y_factor != 1.0:
+            self.primary = np.vstack((
+                self.primary[0] * x_factor,
+                self.primary[1] * y_factor,
+            ))
+
         # ----- ISO 21920-3 setting-class resolution -----------------------
         # If the user did not name a class but supplied explicit cutoffs we
         # treat the configuration as "Custom"; otherwise we fall back to Sc3.
@@ -209,8 +362,8 @@ class SurfaceTexture():
 
         # All canonical class lengths are mm; convert into the data's X unit.
         if sc is not None:
-            sc_lambda_s = convert_mm_to(sc.lambda_s_mm, x_units)
-            sc_lambda_c = convert_mm_to(sc.lambda_c_mm, x_units)
+            sc_lambda_s = convert_mm_to(sc.lambda_s_mm, self.x_units)
+            sc_lambda_c = convert_mm_to(sc.lambda_c_mm, self.x_units)
             sc_target_nsc = sc.nsc
         else:
             sc_lambda_s = sc_lambda_c = None
@@ -232,13 +385,6 @@ class SurfaceTexture():
         self.target_nsc = sc_target_nsc
         self.nsc = sc_target_nsc
 
-        self.primary = self._load_profile_data(
-            self.raw_data,
-            x_col=x_col,
-            y_col=y_col,
-            sheet_name=sheet_name,
-        )
-
         # Keep an immutable copy of the raw input for plotting/inspection.
         self.raw_data_xy = self.primary.copy()
         self.level_fit_x = None
@@ -248,6 +394,7 @@ class SurfaceTexture():
         self.le_window = None              # (x_start, x_end) used for params
         self.dx_warning = None             # populated if dx exceeds Sc dx_max
         self.nsc_warning = None            # populated if nsc reduced below target
+        self.short_trace_override = None   # populated if allow_short_trace forced run
 
         # if profile leveling is called for then fit to line/curve
         if order: 
@@ -348,16 +495,17 @@ class SurfaceTexture():
         nsc_actual = min(self.target_nsc, max_nsc_that_fits)
 
         if nsc_actual < 1:
-            # Suggest the next-smaller setting class if there is one.
-            suggestion = ""
-            if self.setting_class is not None:
-                try:
-                    cur_idx = int(self.setting_class.name[2:])
-                    if cur_idx > 1:
-                        suggestion = f" Tip: try setting class Sc{cur_idx - 1}."
-                except (ValueError, IndexError):
-                    pass
-            raise ValueError(
+            # Build the structured "trace too short" message regardless of
+            # path so both the override warning and the exception share
+            # consistent wording.
+            suggested = _largest_fitting_setting_class(n_pts, T, self.x_units)
+            suggestion_txt = (
+                f" Tip: try setting class {suggested}."
+                if suggested else
+                " Tip: no ISO 21920-3 setting class will fit this trace; "
+                "the trace is shorter than Sc1's λc + filter buffer."
+            )
+            base_msg = (
                 "Trace is too short for the requested ISO 21920-3 setting.\n"
                 f"  Sample spacing dx = {T:.6g} {self.x_units}\n"
                 f"  Cutoffs λs = {self.short_cutoff:g} {self.x_units}, "
@@ -365,7 +513,45 @@ class SurfaceTexture():
                 f"  Filter buffer = {edge_buff} samples each end\n"
                 f"  One sampling length lsc = λc requires {lsc_samples} samples, "
                 f"but only {max(usable, 0)} samples are usable after the "
-                f"filter end-buffers (trace has {n_pts} samples).{suggestion}"
+                f"filter end-buffers (trace has {n_pts} samples).{suggestion_txt}"
+            )
+
+            if not allow_short_trace:
+                raise TraceTooShortError(
+                    base_msg,
+                    suggested_class=suggested,
+                    current_class=self.setting_class_name,
+                    short_cutoff=float(self.short_cutoff),
+                    long_cutoff=float(self.long_cutoff),
+                    x_units=self.x_units,
+                )
+
+            # ----- Override path ------------------------------------------
+            # User has explicitly accepted edge artefacts. Clamp the filter
+            # end-buffers down so we can extract at least one sampling
+            # section. Keep λs/λc unchanged so the L-filter still produces
+            # the requested separation between roughness and waviness.
+            forced_edge = max(0, min(edge_buff, max((n_pts - 2) // 4, 0)))
+            forced_usable = max(n_pts - 2 * forced_edge, 1)
+            forced_lsc_samples = max(forced_usable, 1)
+            edge_buff = forced_edge
+            usable = forced_usable
+            lsc_samples = forced_lsc_samples
+            nsc_actual = 1
+            self.short_trace_override = (
+                "Short-trace override active — results are non-conformant.\n"
+                f"  Requested λc = {self.long_cutoff:g} {self.x_units} kept; "
+                f"nsc forced to 1.\n"
+                f"  Filter end-buffer reduced from "
+                f"{prim_buff + wav_buff} → {forced_edge} samples each end "
+                f"to fit the trace (n = {n_pts}).\n"
+                "  Edge artefacts from the L-filter will be significant; "
+                "treat parameters as indicative only."
+            )
+            import sys as _sys
+            print(
+                f"WARNING: {self.short_trace_override}",
+                file=_sys.stderr,
             )
 
         self.nsc = nsc_actual
@@ -373,7 +559,10 @@ class SurfaceTexture():
         self.evaluation_length = le_samples * T
         self.lsc = float(self.long_cutoff)
 
-        if nsc_actual < self.target_nsc:
+        if (
+            nsc_actual < self.target_nsc
+            and self.short_trace_override is None
+        ):
             # Soft warning — surface via plot banner, GUI log, and stderr.
             self.nsc_warning = (
                 f"Trace is too short for the ISO 21920-3 default of "
@@ -695,6 +884,11 @@ class SurfaceTexture():
                 f"nsc = {self.nsc}"
             )
         warnings = []
+        if getattr(self, 'short_trace_override', None):
+            warnings.append(
+                f"⚠ Short-trace override — nsc = 1, edge artefacts present; "
+                f"results non-conformant with ISO 21920-3"
+            )
         if getattr(self, 'nsc_warning', None):
             warnings.append(
                 f"⚠ nsc reduced to {self.nsc} (ISO default {self.target_nsc}) "
@@ -702,6 +896,15 @@ class SurfaceTexture():
             )
         if getattr(self, 'dx_warning', None):
             warnings.append(f"⚠ {self.dx_warning}")
+        # If source units differ from report units, flag the conversion so
+        # exported figures self-document the unit transformation applied.
+        src_x = getattr(self, 'source_x_units', None)
+        src_y = getattr(self, 'source_y_units', None)
+        if src_x and src_y and (src_x != self.x_units or src_y != self.y_units):
+            warnings.append(
+                f"Source units: {src_x} / {src_y} \u2192 "
+                f"report: {self.x_units} / {self.y_units}"
+            )
         if warnings:
             return "\n".join([line1, line2] + warnings)
         return f"{line1}\n{line2}"

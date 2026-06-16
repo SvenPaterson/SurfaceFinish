@@ -13,7 +13,7 @@ The current implementation targets:
 
 ## Features
 
-- TXT, CSV, and Excel input
+- TXT, CSV, Excel, and Digital Surf `.pro` input
 - ISO setting classes Sc1-Sc5 via `iso21920.py`
 - Automatic derivation of sampling section behavior:
 	- `lsc = λc`
@@ -32,6 +32,11 @@ The current implementation targets:
 	- side-by-side table columns for ISO 21920, ISO 4287, and ASME B46.1
 	- comparison uses each standard's intended roughness pipeline
 	- ISO 4287 and ASME B46.1 are often numerically identical in this tool (Gaussian-based path), which is useful for customer-facing comparisons
+- Batch processing (GUI):
+	- recursive folder scan (depth ≤ 2) with automatic Part / Location grouping
+	- adaptive plan-confirmation popup before processing
+	- multi-sheet Excel workbook export (`Summary`, `Stats`, `Per-measurement`, `Settings`, plus `Failures` if any file errored)
+	- supports `.xlsx`, `.csv`, `.pro` inputs
 
 ## Standards Comparison (GUI)
 
@@ -49,6 +54,32 @@ Notes:
 
 - `Rmr` is computed per column using the selected `Cref`.
 - `Rt` is kept as the total-height metric in the table; `Rzx` is not shown.
+
+## Batch Processing (GUI)
+
+Click **Batch Process** in the GUI to analyze every supported file under a chosen folder using the same settings as a single-file run.
+
+Folder layout:
+
+- The picker scans up to **two levels deep** and groups files by parent folder.
+- A folder one level under the root becomes a **Part**; a folder two levels deep becomes a **Location** within that part.
+- Files sitting directly in the root are grouped under `(root)`.
+- `~$*` Excel lock files, hidden folders, and any folder whose name starts with `TH_Template` are skipped.
+
+Workflow:
+
+1. Pick any one of your data files first so the GUI can infer the source format (`.pro` vs `.csv` vs `.xlsx`).
+2. Tick **Save Excel report (Batch only)** if you want the workbook (default on).
+3. Click **Batch Process** and select the root folder.
+4. A confirmation popup shows the discovered Part / Location tree and total file count; click **Continue** to run.
+
+Workbook output (sheets in order):
+
+- **Summary** — one row per Part (and Location, if present), showing the mean of each parameter. Quick at-a-glance roughness comparison across all parts. Trailing **Units** row.
+- **Stats** — one row per Part with `mean`, `stddev`, `min`, `max` columns for each parameter (e.g. `Ra mean`, `Ra stddev`, `Ra min`, `Ra max`, `Rq mean`, …).
+- **Per-measurement** — one row per individual file, with parameters as columns.
+- **Settings** — audit dump of the run settings (setting class, cutoffs, leveling order, units, etc.).
+- **Failures** — present only if any file errored; lists path and error message.
 
 ## Quick Start
 
@@ -98,6 +129,11 @@ Note: evaluation length (`le`) and sampling section count (`nsc`) are backend-de
 - `--sheet` accepts a sheet name (for example `DATA`) or zero-based sheet index (`0`).
 - `--x-col` and `--y-col` accept zero-based indexes or exact column names.
 - `.txt`/`.csv` inputs use the first two columns unless pre-processed otherwise.
+- `.pro` inputs are Digital Surf 1D profile files (`studiable_type == PROFILE`,
+  magic `DIGITAL SURF` / `DSCOMPRESSED`). Parsing uses the `surfalize` package.
+  X/Y units are taken from the file header (e.g. `in`/`in`) and override
+  `--x-unit` / `--y-unit`; `--sheet`, `--x-col`, and `--y-col` are ignored.
+  2D `.sur` surfaces and other studiable kinds are rejected with a clear error.
 
 ## Environment Setup
 
