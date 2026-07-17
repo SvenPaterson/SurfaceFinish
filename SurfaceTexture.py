@@ -395,6 +395,7 @@ class SurfaceTexture():
         self.dx_warning = None             # populated if dx exceeds Sc dx_max
         self.nsc_warning = None            # populated if nsc reduced below target
         self.short_trace_override = None   # populated if allow_short_trace forced run
+        self.comparison_warnings = []      # populated by compute_comparison_params
 
         # if profile leveling is called for then fit to line/curve
         if order: 
@@ -722,16 +723,160 @@ class SurfaceTexture():
         return params
 
     # ------------------------------------------------------------------
+    # ISO 4287:1997 R-parameters (per-sampling-length aggregation).
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _compute_r_params_iso4287(roughness, nsc, lsc_samples, y_units, Cref=5.0):
+        """Compute R-family parameters per ISO 4287:1997.
+
+        Per §4.2 (Ra, Rq, Rsk, Rku) and §4.1.1–§4.1.3 (Rp, Rv, Rz) each
+        parameter is evaluated on a single *sampling length* and then
+        averaged across the N sampling lengths of the evaluation length
+        (ISO 4288 reporting convention). This differs from a one-shot
+        moment over the whole evaluation length for Rsk and Rku — the
+        per-sampling-length Rq in the denominator changes the result.
+        Ra and Rq are numerically equivalent under the two conventions
+        when all sampling lengths are equal in size.
+
+        Rt (§4.1.5) is the only amplitude parameter defined over the
+        whole evaluation length — kept as ``max(roughness) - min(roughness)``.
+
+        Peak / valley definition (§3.2.4 – §3.2.7): on a roughness
+        profile whose mean line lies at z = 0, every positive-z portion
+        between two consecutive mean-line crossings is a *profile peak*
+        and every negative-z portion is a *profile valley*. The highest
+        peak height ``Zp`` within a sampling length is therefore
+        ``max(seg)`` clipped at 0, and the deepest valley depth ``Zv`` is
+        ``|min(seg)|`` clipped at 0. The §3.2.7 Note (partial peaks /
+        valleys at sampling-length boundaries still count) is satisfied
+        automatically by the slice-and-max approach. A defensive check
+        on the zero-mean assumption is included.
+
+        Parameters
+        ----------
+        roughness : ndarray
+            1-D roughness profile over the evaluation length, already
+            band-pass filtered by λs (S-filter) + λc (L-filter) per
+            §3.1.6 Note 1.
+        nsc : int
+            Number of sampling lengths within the evaluation length.
+        lsc_samples : int
+            Samples per sampling length.
+        y_units : str
+            Unit label for amplitude parameters.
+        Cref : float
+            Material ratio reference percentage for the Rmr heuristic.
+            NOTE: this is *not* the literal §4.5.1 Rmr(c); it is the
+            Cref/Rz-quarter heuristic re-used from the ISO 21920 path so
+            the comparison column keeps a single Rmr semantics across
+            standards. To be revisited in the ISO 21920 audit.
+
+        Returns
+        -------
+        dict
+            ``{param_name: (value, unit)}`` matching
+            :meth:`_compute_r_params`: Ra, Rq, Rsk, Rku, Rp, Rv, Rz, Rt, Rmr.
+        """
+        params = {}
+
+        # ISO 4287 §3.1.5 defines the mean line locally over the evaluation
+        # length. The Gaussian L-filter produces a zero-mean output *over
+        # the full trace*; the centred evaluation-length slice can retain
+        # a small residual mean (typical Gaussian edge effect). Subtract
+        # the local mean here so the §3.2.4 / §3.2.5 peak/valley
+        # equivalence to ``max(seg)`` / ``|min(seg)|`` holds. ``info``
+        # returns the raw offset so the caller can surface a warning if
+        # the residual is unusually large (real filtering pathology).
+        info = {"mean_offset": 0.0, "span": 0.0}
+        if roughness.size:
+            span = float(np.max(roughness) - np.min(roughness))
+            mean_off = float(np.mean(roughness))
+            info["mean_offset"] = mean_off
+            info["span"] = span
+            roughness = roughness - mean_off
+
+        Ra_i, Rq_i, Rsk_i, Rku_i = [], [], [], []
+        Rp_i, Rv_i, Rz_i = [], [], []
+        for i in range(nsc):
+            seg = roughness[i * lsc_samples:(i + 1) * lsc_samples]
+            if seg.size == 0:
+                continue
+            # §4.2 amplitude parameters over one sampling length.
+            Ra_i.append(float(np.mean(np.abs(seg))))
+            rq = float(np.sqrt(np.mean(seg ** 2)))
+            Rq_i.append(rq)
+            if rq > 0:
+                Rsk_i.append(float(np.mean(seg ** 3)) / (rq ** 3))
+                Rku_i.append(float(np.mean(seg ** 4)) / (rq ** 4))
+            else:
+                Rsk_i.append(0.0)
+                Rku_i.append(0.0)
+            # §4.1.1 – §4.1.3 peak / valley parameters over one sampling
+            # length. Clip at 0 so an all-positive or all-negative slice
+            # still yields Rp ≥ 0 and Rv ≥ 0.
+            sp = max(float(np.max(seg)), 0.0)
+            sv = max(float(-np.min(seg)), 0.0)
+            Rp_i.append(sp)
+            Rv_i.append(sv)
+            Rz_i.append(sp + sv)
+
+        if Ra_i:
+            params['Ra']  = (float(np.mean(Ra_i)),  y_units)
+            params['Rq']  = (float(np.mean(Rq_i)),  y_units)
+            params['Rsk'] = (float(np.mean(Rsk_i)), "")
+            params['Rku'] = (float(np.mean(Rku_i)), "")
+            params['Rp']  = (float(np.mean(Rp_i)),  y_units)
+            params['Rv']  = (float(np.mean(Rv_i)),  y_units)
+            params['Rz']  = (float(np.mean(Rz_i)),  y_units)
+        else:
+            for k in ('Ra', 'Rq', 'Rp', 'Rv', 'Rz'):
+                params[k] = (0.0, y_units)
+            params['Rsk'] = (0.0, "")
+            params['Rku'] = (0.0, "")
+
+        # §4.1.5 — Rt is defined over the whole evaluation length.
+        if roughness.size:
+            params['Rt'] = (float(np.max(roughness) - np.min(roughness)), y_units)
+        else:
+            params['Rt'] = (0.0, y_units)
+
+        # Rmr — Cref/Rz-quarter heuristic kept from the ISO 21920 helper
+        # (not the literal §4.5.1 Rmr(c)). See docstring note above.
+        n = roughness.size
+        Rz_eval = params['Rz'][0]
+        unit_label = f"% (@Rz/4, Cref={Cref:g}%)"
+        if n > 0:
+            sorted_desc = np.sort(roughness)[::-1]
+            idx = max(0, min(n - 1, int(round(Cref / 100.0 * n))))
+            c0 = sorted_desc[idx]
+            target = c0 - Rz_eval / 4.0
+            above = int(np.sum(sorted_desc >= target))
+            params['Rmr'] = (above / n * 100.0, unit_label)
+        else:
+            params['Rmr'] = (0.0, unit_label)
+        return params, info
+
+    # ------------------------------------------------------------------
     # Multi-standard comparison computation.
     # ------------------------------------------------------------------
     def compute_comparison_params(self, Cref=5.0):
-        """Compute R-parameters under ISO 21920, ISO 4287, and ASME B46.1 pipelines.
+        """Compute R-parameters under ISO 21920, ISO 4287, and ASME B46.1.
 
-        ISO 21920: S-filter (λs) + L-filter (λc) — already computed.
-        ISO 4287 / B46.1 (Gaussian): L-filter (λc) only, no S-filter.
+        Filter pipelines:
 
-        Stores results in self.comparison_params as:
-            {'ISO 21920': {...}, 'ISO 4287': {...}, 'B46.1': {...}}
+        - ISO 21920: S-filter (λs) + L-filter (λc) — already computed and
+          stored in :attr:`R_params`.
+        - ISO 4287: S-filter (λs) + L-filter (λc) per §3.1.6 Note 1 (the
+          transmission band of the roughness profile is defined by *both*
+          λs and λc). The filtered roughness profile therefore matches
+          the ISO 21920 one — the two columns differ only in parameter
+          math (per-sampling-length averaging here vs the ISO 21920
+          section-based aggregation in :meth:`_compute_r_params`).
+        - B46.1: identical math and filter to ISO 4287 under harmonised
+          Gaussian filtering.
+
+        Stores the result in :attr:`comparison_params` as
+        ``{'ISO 21920': {...}, 'ISO 4287': {...}, 'B46.1': {...}}``.
         """
         # Recompute ISO 21920 Rmr with the requested Cref.
         self.compute_Rmr(Cref=Cref)
@@ -739,21 +884,37 @@ class SurfaceTexture():
         iso21920_params = {k: self.R_params[k] for k in
                           ['Ra', 'Rq', 'Rp', 'Rv', 'Rz', 'Rt', 'Rsk', 'Rku', 'Rmr']}
 
-        # ISO 4287 / B46.1: apply only L-filter (λc) directly to primary
-        # (skip S-filter). Use the same Gaussian filter and evaluation window.
-        waviness_no_s_full = self._gauss_filter(self.primary[1], 1.0 / self.long_cutoff)
-        roughness_no_s_full = self.primary[1] - waviness_no_s_full
+        # ISO 4287 / B46.1 filter chain: S-filter (λs) then L-filter (λc),
+        # per §3.1.6 Note 1. Identical to the ISO 21920 pipeline; the
+        # difference between columns is purely in the parameter math.
+        denoised_full = self._gauss_filter(self.primary[1], 1.0 / self.short_cutoff)
+        waviness_4287_full = self._gauss_filter(denoised_full, 1.0 / self.long_cutoff)
+        roughness_4287_full = denoised_full - waviness_4287_full
 
         # Slice to the same evaluation window used for ISO 21920.
-        roughness_no_s = roughness_no_s_full[self._le_start:self._le_end]
+        roughness_4287 = roughness_4287_full[self._le_start:self._le_end]
 
-        iso4287_params = self._compute_r_params(
-            roughness_no_s, self.nsc, self._lsc_samples, self.y_units, Cref=Cref
+        iso4287_params, iso4287_info = self._compute_r_params_iso4287(
+            roughness_4287, self.nsc, self._lsc_samples, self.y_units, Cref=Cref
         )
         # B46.1 with Gaussian filter is identical to ISO 4287.
-        b461_params = self._compute_r_params(
-            roughness_no_s, self.nsc, self._lsc_samples, self.y_units, Cref=Cref
+        b461_params, _ = self._compute_r_params_iso4287(
+            roughness_4287, self.nsc, self._lsc_samples, self.y_units, Cref=Cref
         )
+
+        # Reset then repopulate any non-fatal comparison notes. Currently
+        # only flags a large post-filter residual mean (> 1% of span);
+        # normal Gaussian edge residuals stay silent.
+        self.comparison_warnings = []
+        span = iso4287_info.get("span", 0.0)
+        mean_off = abs(iso4287_info.get("mean_offset", 0.0))
+        if span > 0 and mean_off > 1e-2 * span:
+            self.comparison_warnings.append(
+                f"ISO 4287 / B46.1 roughness had residual mean "
+                f"{mean_off:.3g} {self.y_units} "
+                f"({mean_off / span * 100:.2f}% of span); demeaned before "
+                "parameter extraction (ISO 4287 §3.1.5)."
+            )
 
         self.comparison_params = {
             'ISO 21920': iso21920_params,
@@ -896,6 +1057,8 @@ class SurfaceTexture():
             )
         if getattr(self, 'dx_warning', None):
             warnings.append(f"⚠ {self.dx_warning}")
+        for note in getattr(self, 'comparison_warnings', []) or []:
+            warnings.append(f"⚠ {note}")
         # If source units differ from report units, flag the conversion so
         # exported figures self-document the unit transformation applied.
         src_x = getattr(self, 'source_x_units', None)

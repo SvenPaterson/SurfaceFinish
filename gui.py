@@ -325,19 +325,63 @@ class SurfaceFinishGUI(tk.Tk):
 
         left = ttk.Frame(paned, padding=6)
         right = ttk.Frame(paned, padding=6)
-        paned.add(left, weight=0)
-        paned.add(right, weight=1)
 
+        # Populate the panes *before* inserting them into the PanedWindow.
+        # Tk uses each child's requested size to pick the initial sash
+        # position; if we add empty frames first the sash settles near 0
+        # and the deferred sashpos() below cannot always recover (silent
+        # failure if the paned isn't mapped yet). Building first gives
+        # the left pane a real natural width on insertion.
         self._build_left_panel(left)
         self._build_right_panel(right)
+
+        # ``ttk.PanedWindow.add`` does not support ``minsize`` (that is a
+        # classic ``tk.PanedWindow`` option). We instead clamp the sash
+        # from below via a ``<B1-Motion>`` / ``<ButtonRelease-1>`` handler
+        # so neither pane can ever collapse to zero width.
+        paned.add(left, weight=0)
+        paned.add(right, weight=1)
+        self._left_min = 600
+        self._right_min = 300
+        paned.bind("<B1-Motion>", self._clamp_sash)
+        paned.bind("<ButtonRelease-1>", self._clamp_sash)
+
         self.after(50, self._set_initial_plot_width)
 
-    def _set_initial_plot_width(self) -> None:
+    def _clamp_sash(self, _event: tk.Event | None = None) -> None:
+        """Keep the first sash within ``[_left_min, width - _right_min]``."""
+        try:
+            pos = self._paned.sashpos(0)
+            total = self._paned.winfo_width()
+        except tk.TclError:
+            return
+        if total <= 0:
+            return
+        lo = self._left_min
+        hi = max(lo, total - self._right_min)
+        new_pos = max(lo, min(pos, hi))
+        if new_pos != pos:
+            try:
+                self._paned.sashpos(0, new_pos)
+            except tk.TclError:
+                pass
+
+    def _set_initial_plot_width(self, _retry: bool = True) -> None:
         # Reserve a fixed control pane and give most width to plotting pane.
+        # If sashpos() raises (typically because the paned isn't mapped
+        # yet on slower Windows/Tk startups) re-try once via after_idle so
+        # the failure can't silently leave the sash at 0.
         try:
             self._paned.sashpos(0, 600)
-        except Exception:
-            pass
+        except tk.TclError as exc:
+            if _retry:
+                self.after_idle(lambda: self._set_initial_plot_width(False))
+                return
+            import sys
+            print(
+                f"[SurfaceFinishGUI] Could not set initial sash position: {exc}",
+                file=sys.stderr,
+            )
 
     def _build_left_panel(self, parent: ttk.Frame) -> None:
         pad = {"padx": 6, "pady": 4}
